@@ -14,23 +14,33 @@ import {
   UploadCloud,
 } from 'lucide-react';
 import type { CdnAsset, MediaKind } from '../types/cdn';
-import { buildCdnUrls, formatBytes, formatDateVi, formatDuration } from '../lib/format';
+import {
+  buildAuthedProxyUrl,
+  buildCdnUrls,
+  formatBytes,
+  formatDateVi,
+  formatDuration,
+} from '../lib/format';
 
 interface LibraryViewProps {
   assets: CdnAsset[];
   loading: boolean;
-  isOwnerSignedIn: boolean;
+  canManage: boolean;
+  canUpload?: boolean;
+  authToken?: string | null;
   activeBucket: string;
   onRefresh: () => void;
   onInspect: (asset: CdnAsset) => void;
-  onGoToUpload: () => void;
-  onGoToDocs: () => void;
+  onGoToUpload?: () => void;
+  onGoToDocs?: () => void;
 }
 
 export function LibraryView({
   assets,
   loading,
-  isOwnerSignedIn,
+  canManage,
+  canUpload = false,
+  authToken,
   activeBucket,
   onRefresh,
   onInspect,
@@ -47,8 +57,8 @@ export function LibraryView({
   const filtered = assets.filter((item) => {
     if (activeBucket !== 'ALL' && item.bucket !== activeBucket) return false;
     if (kindFilter !== 'all' && item.kind !== kindFilter) return false;
-    if (visibilityFilter === 'public' && !item.isPublic) return false;
-    if (visibilityFilter === 'private' && item.isPublic) return false;
+    if (canManage && visibilityFilter === 'public' && !item.isPublic) return false;
+    if (canManage && visibilityFilter === 'private' && item.isPublic) return false;
     if (search.trim()) {
       const q = search.trim().toLowerCase();
       return (
@@ -86,7 +96,7 @@ export function LibraryView({
             {activeBucket === 'ALL' ? 'Thư viện Media Cloud' : `Thư mục: ${activeBucket}`}
           </h1>
           <p className="mt-1 text-sm text-zinc-600 tabular-nums">
-            Xem trực tiếp video và hình ảnh được lưu trữ trên Google Drive · Không cần đăng nhập ({filtered.length} tệp).
+            Kho lưu trữ tập trung hình ảnh &amp; video trên Google Drive · {filtered.length} tệp.
           </p>
         </div>
 
@@ -100,14 +110,16 @@ export function LibraryView({
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
             Làm mới
           </button>
-          <button
-            type="button"
-            onClick={onGoToUpload}
-            className="inline-flex min-h-[44px] sm:min-h-0 items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
-          >
-            <UploadCloud className="h-3.5 w-3.5" />
-            Tải lên media
-          </button>
+          {canUpload && onGoToUpload && (
+            <button
+              type="button"
+              onClick={onGoToUpload}
+              className="inline-flex min-h-[44px] sm:min-h-0 items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
+            >
+              <UploadCloud className="h-3.5 w-3.5" />
+              Tải lên media
+            </button>
+          )}
         </div>
       </div>
 
@@ -148,7 +160,7 @@ export function LibraryView({
             ))}
           </div>
 
-          {isOwnerSignedIn && (
+          {canManage && (
             <div className="flex items-center gap-1 rounded-lg bg-zinc-100 p-1">
               {(
                 [
@@ -226,20 +238,24 @@ export function LibraryView({
                 : 'Tải lên video hoặc hình ảnh đầu tiên để lưu trữ trực tiếp trên dung lượng Google Drive và xem ngay trên ứng dụng web này.'}
             </p>
             <div className="mt-6 flex flex-wrap items-center gap-3">
-              <button
-                type="button"
-                onClick={onGoToUpload}
-                className="min-h-[44px] sm:min-h-0 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
-              >
-                Tải lên tệp đầu tiên
-              </button>
-              <button
-                type="button"
-                onClick={onGoToDocs}
-                className="min-h-[44px] sm:min-h-0 rounded-lg border border-zinc-200 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-50 whitespace-nowrap shrink-0"
-              >
-                Hướng dẫn &amp; Deploy Vercel
-              </button>
+              {canUpload && onGoToUpload && (
+                <button
+                  type="button"
+                  onClick={onGoToUpload}
+                  className="min-h-[44px] sm:min-h-0 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
+                >
+                  Tải lên tệp đầu tiên
+                </button>
+              )}
+              {onGoToDocs && (
+                <button
+                  type="button"
+                  onClick={onGoToDocs}
+                  className="min-h-[44px] sm:min-h-0 rounded-lg border border-zinc-200 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-50 whitespace-nowrap shrink-0"
+                >
+                  Hướng dẫn &amp; Deploy Vercel
+                </button>
+              )}
             </div>
           </div>
           <div className="hidden bg-zinc-100 lg:col-span-5 lg:block">
@@ -256,13 +272,14 @@ export function LibraryView({
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
           {filtered.map((asset) => {
             const urls = buildCdnUrls(asset, window.location.origin);
+            const authedProxy = buildAuthedProxyUrl(urls.proxyUrl, authToken);
             const stage = imgFallbackStage[asset.fileId];
             const imgSrc =
               stage === 'proxy'
-                ? urls.proxyUrl
+                ? authedProxy
                 : asset.isPublic
                 ? `https://lh3.googleusercontent.com/d/${asset.fileId}=w800`
-                : asset.thumbnailLink || urls.proxyUrl;
+                : asset.thumbnailLink || authedProxy;
 
             return (
               <div
@@ -396,7 +413,7 @@ export function LibraryView({
                   </td>
                   <td className="px-4 py-3 text-xs text-zinc-600">{asset.bucket}</td>
                   <td className="px-4 py-3 text-xs text-zinc-600">
-                    {asset.uploadedBy || 'Chủ sở hữu'}
+                    {asset.uploadedBy || 'Admin'}
                   </td>
                   <td className="px-4 py-3 text-xs">
                     {asset.isPublic ? (

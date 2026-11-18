@@ -57,6 +57,7 @@ const HAS_KV = Boolean(KV_URL && KV_TOKEN);
 const DRIVE_BRIDGE_URL = (process.env.DRIVE_BRIDGE_URL || '').trim();
 const DRIVE_BRIDGE_SECRET = (process.env.DRIVE_BRIDGE_SECRET || '').trim();
 const PINNED_DRIVE_FOLDER_ID = (process.env.DRIVE_FOLDER_ID || '').trim();
+const BOOTSTRAPPED_ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'karestmoe@gmail.com').trim().toLowerCase();
 
 const DATA_DIR = IS_VERCEL ? '/tmp/drivecdn-data' : path.resolve(process.cwd(), 'data');
 const CATALOG_PATH = path.join(DATA_DIR, 'cdn-catalog.json');
@@ -630,17 +631,243 @@ async function publishAndIndexDriveFile(
   return entry;
 }
 
+interface FirebaseServerConfig {
+  apiKey: string;
+  authDomain: string;
+  projectId: string;
+  appId: string;
+  storageBucket: string;
+  messagingSenderId: string;
+  firestoreDatabaseId: string;
+}
+
+function resolveFirebaseServerConfig(): FirebaseServerConfig | null {
+  const apiKey = process.env.FIREBASE_API_KEY;
+  const authDomain = process.env.FIREBASE_AUTH_DOMAIN;
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const appId = process.env.FIREBASE_APP_ID;
+
+  if (apiKey && authDomain && projectId && appId) {
+    return {
+      apiKey,
+      authDomain,
+      projectId,
+      appId,
+      storageBucket: process.env.FIREBASE_STORAGE_BUCKET || '',
+      messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '',
+      firestoreDatabaseId: process.env.FIREBASE_FIRESTORE_DATABASE_ID || '(default)',
+    };
+  }
+
+  try {
+    const cfgPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+    if (fs.existsSync(cfgPath)) {
+      const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf-8')) as Record<string, string>;
+      if (parsed.apiKey && parsed.authDomain && parsed.projectId && parsed.appId) {
+        return {
+          apiKey: parsed.apiKey,
+          authDomain: parsed.authDomain,
+          projectId: parsed.projectId,
+          appId: parsed.appId,
+          storageBucket: parsed.storageBucket || '',
+          messagingSenderId: parsed.messagingSenderId || '',
+          firestoreDatabaseId: parsed.firestoreDatabaseId || '(default)',
+        };
+      }
+    }
+  } catch {
+    // Ignore read error
+  }
+
+  return null;
+}
+
+interface VerifiedUserAccess {
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  displayName: string;
+  isAdmin: boolean;
+  canView: boolean;
+  canUpload: boolean;
+  status: 'pending' | 'approved' | 'revoked';
+}
+
+const idTokenIdentityCache = new Map<
+  string,
+  { uid: string; email: string; emailVerified: boolean; displayName: string; expiresAt: number }
+>();
+
+function extractFirebaseIdToken(req: Request): string | null {
+  const headerToken = req.headers['x-firebase-id-token'];
+  if (typeof headerToken === 'string' && headerToken.trim()) {
+    return headerToken.trim();
+  }
+  const queryToken = req.query.token;
+  if (typeof queryToken === 'string' && queryToken.trim()) {
+    return queryToken.trim();
+  }
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const candidate = authHeader.slice('Bearer '.length).trim();
+    if (candidate && !candidate.startsWith('ya29.')) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function verifyUserAccess(req: Request): Promise<VerifiedUserAccess | null> {
+  const idToken = extractFirebaseIdToken(req);
+  if (!idToken) return null;
+
+  const cfg = resolveFirebaseServerConfig();
+  if (!cfg) return null;
+
+  let identity = idTokenIdentityCache.get(idToken);
+  if (!identity || Date.now() >= identity.expiresAt) {
+    try {
+      const lookupRes = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(cfg.apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken }),
+        }
+      );
+      if (!lookupRes.ok) return null;
+      const lookupData = (await lookupRes.json()) as {
+        users?: Array<{
+          localId?: string;
+          email?: string;
+          emailVerified?: boolean;
+          displayName?: string;
+        }>;
+      };
+      const u = lookupData.users?.[0];
+      if (!u?.localId || !u.email) return null;
+
+      identity = {
+        uid: u.localId,
+        email: u.email,
+        emailVerified: Boolean(u.emailVerified),
+        displayName: u.displayName || u.email.split('@')[0],
+        expiresAt: Date.now() + 5 * 60 * 1000,
+      };
+      idTokenIdentityCache.set(idToken, identity);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!identity.emailVerified) {
+    return null;
+  }
+
+  if (identity.email.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL) {
+    return {
+      uid: identity.uid,
+      email: identity.email,
+      emailVerified: true,
+      displayName: identity.displayName,
+      isAdmin: true,
+      canView: true,
+      canUpload: true,
+      status: 'approved',
+    };
+  }
+
+  const dbId = cfg.firestoreDatabaseId || '(default)';
+  const fsBase = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(cfg.projectId)}/databases/${encodeURIComponent(dbId)}/documents`;
+
+  try {
+    const adminRes = await fetch(`${fsBase}/admins/${encodeURIComponent(identity.uid)}`, {
+      headers: { Authorization: `Bearer ${idToken}` },
+    });
+    if (adminRes.ok) {
+      return {
+        uid: identity.uid,
+        email: identity.email,
+        emailVerified: true,
+        displayName: identity.displayName,
+        isAdmin: true,
+        canView: true,
+        canUpload: true,
+        status: 'approved',
+      };
+    }
+
+    const userRes = await fetch(`${fsBase}/users/${encodeURIComponent(identity.uid)}`, {
+      headers: { Authorization: `Bearer ${idToken}` },
+    });
+    if (!userRes.ok) {
+      return {
+        uid: identity.uid,
+        email: identity.email,
+        emailVerified: true,
+        displayName: identity.displayName,
+        isAdmin: false,
+        canView: false,
+        canUpload: false,
+        status: 'pending',
+      };
+    }
+
+    const docData = (await userRes.json()) as {
+      fields?: {
+        role?: { stringValue?: string };
+        status?: { stringValue?: string };
+        canView?: { booleanValue?: boolean };
+        canUpload?: { booleanValue?: boolean };
+      };
+    };
+
+    const fields = docData.fields || {};
+    const statusRaw = fields.status?.stringValue;
+    const status: 'pending' | 'approved' | 'revoked' =
+      statusRaw === 'approved' || statusRaw === 'revoked' ? statusRaw : 'pending';
+    const isAdminDoc = fields.role?.stringValue === 'admin';
+    const canView = isAdminDoc || (status === 'approved' && Boolean(fields.canView?.booleanValue));
+    const canUpload = isAdminDoc || (status === 'approved' && Boolean(fields.canUpload?.booleanValue));
+
+    return {
+      uid: identity.uid,
+      email: identity.email,
+      emailVerified: true,
+      displayName: identity.displayName,
+      isAdmin: isAdminDoc,
+      canView,
+      canUpload,
+      status,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function createApiApp(): Express {
   ensureCatalogFile();
   const app = express();
 
-  // Fallback raw streaming upload (used on local/Cloud Run or small <= 4MB files)
+  // Fallback raw streaming upload (used on local/Cloud Run or small <= 4.5MB files)
   app.post('/api/public/upload', async (req: Request, res: Response) => {
+    const access = await verifyUserAccess(req);
+    if (!access) {
+      res.status(401).json({ error: 'Vui lòng đăng nhập tài khoản Google để tải tệp lên.' });
+      return;
+    }
+    if (!access.canUpload) {
+      res.status(403).json({
+        error: 'Tài khoản Google của bạn chưa được Admin cấp quyền tải tệp lên.',
+      });
+      return;
+    }
+
     const relay = await getActiveRelay();
     if (!relay) {
       res.status(503).json({
         error:
-          'Cổng nhận tải lên công khai hiện chưa được chủ sở hữu kích hoạt hoặc phiên kết nối Drive đã hết hạn.',
+          'Cổng nhận tải lên hiện chưa được Admin kích hoạt hoặc phiên kết nối Drive đã hết hạn.',
       });
       return;
     }
@@ -650,8 +877,7 @@ export function createApiApp(): Express {
     const mimeType = String(req.headers['x-file-type'] || req.headers['content-type'] || 'application/octet-stream');
     const fileSize = Number(req.headers['x-file-size'] || req.headers['content-length'] || 0);
     const requestedBucket = String(req.headers['x-bucket-name'] || '').trim();
-    const rawUploader = String(req.headers['x-uploader-name'] || '').trim();
-    const uploadedBy = rawUploader ? decodeURIComponent(rawUploader).slice(0, 60) : 'Khách công khai';
+    const uploadedBy = access.displayName || access.email;
 
     if (!mimeType.startsWith('image/') && !mimeType.startsWith('video/')) {
       res.status(400).json({ error: 'Chỉ hỗ trợ tải lên tệp hình ảnh hoặc video.' });
@@ -796,42 +1022,11 @@ export function createApiApp(): Express {
 
   // Runtime Firebase public Web SDK configuration (avoids VITE_ build-time env var warnings on Vercel)
   app.get('/api/firebase-config', (_req: Request, res: Response) => {
-    const apiKey = process.env.FIREBASE_API_KEY;
-    const authDomain = process.env.FIREBASE_AUTH_DOMAIN;
-    const projectId = process.env.FIREBASE_PROJECT_ID;
-    const appId = process.env.FIREBASE_APP_ID;
-
-    if (apiKey && authDomain && projectId && appId) {
+    const cfg = resolveFirebaseServerConfig();
+    if (cfg) {
       res.setHeader('Cache-Control', 'no-store');
-      res.json({
-        apiKey,
-        authDomain,
-        projectId,
-        appId,
-        storageBucket: process.env.FIREBASE_STORAGE_BUCKET || '',
-        messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '',
-      });
+      res.json(cfg);
       return;
-    }
-
-    try {
-      const cfgPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
-      if (fs.existsSync(cfgPath)) {
-        const raw = fs.readFileSync(cfgPath, 'utf-8');
-        const parsed = JSON.parse(raw) as Record<string, string>;
-        res.setHeader('Cache-Control', 'no-store');
-        res.json({
-          apiKey: parsed.apiKey || '',
-          authDomain: parsed.authDomain || '',
-          projectId: parsed.projectId || '',
-          appId: parsed.appId || '',
-          storageBucket: parsed.storageBucket || '',
-          messagingSenderId: parsed.messagingSenderId || '',
-        });
-        return;
-      }
-    } catch {
-      // Ignore fallback read failure
     }
 
     res.status(404).json({ error: 'Chưa cấu hình Firebase Auth.' });
@@ -839,11 +1034,23 @@ export function createApiApp(): Express {
 
   // Vercel-friendly Direct-to-Drive Resumable Upload Session (bypasses 4.5MB serverless limit!)
   app.post('/api/public/upload-session', async (req: Request, res: Response) => {
+    const access = await verifyUserAccess(req);
+    if (!access) {
+      res.status(401).json({ error: 'Vui lòng đăng nhập tài khoản Google để tải tệp lên.' });
+      return;
+    }
+    if (!access.canUpload) {
+      res.status(403).json({
+        error: 'Tài khoản Google của bạn chưa được Admin cấp quyền tải tệp lên.',
+      });
+      return;
+    }
+
     const relay = await getActiveRelay();
     if (!relay) {
       res.status(503).json({
         error:
-          'Cổng nhận tải lên công khai hiện chưa được chủ sở hữu kích hoạt hoặc phiên kết nối Drive đã hết hạn.',
+          'Cổng nhận tải lên hiện chưa được Admin kích hoạt hoặc phiên kết nối Drive đã hết hạn.',
       });
       return;
     }
@@ -963,13 +1170,23 @@ export function createApiApp(): Express {
   });
 
   app.post('/api/public/upload-complete', async (req: Request, res: Response) => {
+    const access = await verifyUserAccess(req);
+    if (!access) {
+      res.status(401).json({ error: 'Vui lòng đăng nhập tài khoản Google.' });
+      return;
+    }
+    if (!access.canUpload) {
+      res.status(403).json({ error: 'Tài khoản chưa được Admin cấp quyền tải tệp lên.' });
+      return;
+    }
+
     const relay = await getActiveRelay();
     if (!relay) {
       res.status(503).json({ error: 'Phiên kết nối Drive của chủ sở hữu không còn hoạt động.' });
       return;
     }
 
-    const { fileId, bucketName, folderId, uploaderName, fileName, mimeType, fileSize } = req.body as {
+    const { fileId, bucketName, folderId, fileName, mimeType, fileSize } = req.body as {
       fileId?: string;
       bucketName?: string;
       folderId?: string;
@@ -990,7 +1207,7 @@ export function createApiApp(): Express {
         fileId,
         bucketName || 'Images',
         folderId || '',
-        (uploaderName || '').trim().slice(0, 60) || 'Khách công khai',
+        access.displayName || access.email,
         relay.ownerName,
         relay.ownerEmail,
         fileName,
@@ -1031,6 +1248,12 @@ export function createApiApp(): Express {
   });
 
   app.post('/api/cloud/activate', async (req: Request, res: Response) => {
+    const access = await verifyUserAccess(req);
+    if (!access?.isAdmin) {
+      res.status(403).json({ error: 'Chỉ tài khoản Admin mới có quyền kích hoạt cổng Drive.' });
+      return;
+    }
+
     const authHeader = req.headers.authorization;
     const driveUser = await verifyDriveToken(authHeader);
     if (!driveUser || !authHeader) {
@@ -1069,6 +1292,7 @@ export function createApiApp(): Express {
       active: true,
       mode: nextRelay.mode,
       bridgeConfigured: Boolean(DRIVE_BRIDGE_URL),
+      rootFolderId: PINNED_DRIVE_FOLDER_ID || nextRelay.rootFolderId,
       ownerName: nextRelay.ownerName,
       ownerEmail: nextRelay.ownerEmail,
       expiresAt: nextRelay.expiresAt,
@@ -1078,6 +1302,11 @@ export function createApiApp(): Express {
   });
 
   app.post('/api/cloud/deactivate', async (req: Request, res: Response) => {
+    const access = await verifyUserAccess(req);
+    if (!access?.isAdmin) {
+      res.status(403).json({ error: 'Chỉ tài khoản Admin mới có quyền tạm ngưng cổng Drive.' });
+      return;
+    }
     const authHeader = req.headers.authorization;
     if (authHeader) {
       const driveUser = await verifyDriveToken(authHeader);
@@ -1094,7 +1323,19 @@ export function createApiApp(): Express {
     });
   });
 
-  app.get('/api/cdn/catalog', async (_req: Request, res: Response) => {
+  app.get('/api/cdn/catalog', async (req: Request, res: Response) => {
+    const access = await verifyUserAccess(req);
+    if (!access) {
+      res.status(401).json({ error: 'Vui lòng đăng nhập tài khoản Google để xem thư viện.' });
+      return;
+    }
+    if (!access.canView) {
+      res.status(403).json({
+        error: 'Tài khoản của bạn chưa được Admin cấp quyền xem thư viện media.',
+      });
+      return;
+    }
+
     const localEntries = (await readCatalog()).filter((item) => item.isPublic);
     const mergedMap = new Map<string, CatalogEntry>();
     for (const item of localEntries) {
@@ -1131,6 +1372,11 @@ export function createApiApp(): Express {
   });
 
   app.post('/api/cdn/catalog', async (req: Request, res: Response) => {
+    const access = await verifyUserAccess(req);
+    if (!access?.isAdmin) {
+      res.status(403).json({ error: 'Chỉ Admin mới có quyền quản trị danh mục trực tiếp.' });
+      return;
+    }
     const authHeader = req.headers.authorization;
     const driveUser = await verifyDriveToken(authHeader);
     if (!driveUser) {
@@ -1212,6 +1458,11 @@ export function createApiApp(): Express {
   });
 
   app.patch('/api/cdn/catalog/:fileId', async (req: Request, res: Response) => {
+    const access = await verifyUserAccess(req);
+    if (!access?.isAdmin) {
+      res.status(403).json({ error: 'Chỉ Admin mới có quyền chỉnh sửa tệp.' });
+      return;
+    }
     const authHeader = req.headers.authorization;
     const driveUser = await verifyDriveToken(authHeader);
     if (!driveUser) {
@@ -1236,6 +1487,11 @@ export function createApiApp(): Express {
   });
 
   app.delete('/api/cdn/catalog/:fileId', async (req: Request, res: Response) => {
+    const access = await verifyUserAccess(req);
+    if (!access?.isAdmin) {
+      res.status(403).json({ error: 'Chỉ Admin mới có quyền xóa tệp.' });
+      return;
+    }
     const authHeader = req.headers.authorization;
     const driveUser = await verifyDriveToken(authHeader);
     if (!driveUser) {
@@ -1252,6 +1508,16 @@ export function createApiApp(): Express {
   });
 
   app.get('/api/cdn/raw/:fileId', async (req: Request, res: Response) => {
+    const access = await verifyUserAccess(req);
+    if (!access?.canView) {
+      res.status(access ? 403 : 401).json({
+        error: access
+          ? 'Tài khoản của bạn chưa được Admin cấp quyền xem tệp này.'
+          : 'Vui lòng đăng nhập tài khoản Google được cấp quyền để xem.',
+      });
+      return;
+    }
+
     const fileId = String(req.params.fileId || '').trim();
     if (!fileId || !/^[A-Za-z0-9_-]{10,}$/.test(fileId)) {
       res.status(400).json({ error: 'Mã fileId Google Drive không hợp lệ.' });

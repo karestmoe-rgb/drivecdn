@@ -62,6 +62,12 @@ export function buildCdnUrls(asset: CdnAsset, origin: string) {
   };
 }
 
+export function buildAuthedProxyUrl(proxyUrl: string, authToken?: string | null): string {
+  if (!authToken) return proxyUrl;
+  const separator = proxyUrl.includes('?') ? '&' : '?';
+  return `${proxyUrl}${separator}token=${encodeURIComponent(authToken)}`;
+}
+
 function escapeHtmlAttr(str: string): string {
   return str.replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }

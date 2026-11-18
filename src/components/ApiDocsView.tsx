@@ -32,9 +32,9 @@ export function ApiDocsView({ sampleAsset }: ApiDocsViewProps) {
     },
     {
       key: 'catalog',
-      title: '03. API lấy danh sách media công khai',
-      description: 'Truy xuất JSON toàn bộ hình ảnh & video đang lưu trữ trên Cloud.',
-      code: `const res = await fetch('${origin}/api/cdn/catalog');\nconst { items, stats } = await res.json();\nconsole.log('Tổng số tệp:', stats.totalFiles);`,
+      title: '03. API lấy danh sách media (Đã bảo vệ RBAC)',
+      description: 'Yêu cầu X-Firebase-Id-Token của tài khoản Google đã được Admin cấp quyền Xem file.',
+      code: `const res = await fetch('${origin}/api/cdn/catalog', {\n  headers: { 'X-Firebase-Id-Token': firebaseIdToken },\n});\nconst { items, stats } = await res.json();\nconsole.log('Tổng số tệp:', stats.totalFiles);`,
     },
   ];
 

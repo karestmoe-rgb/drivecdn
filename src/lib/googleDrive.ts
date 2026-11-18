@@ -1,167 +1,8 @@
-import { initializeApp, getApps, type FirebaseApp } from 'firebase/app';
-import {
-  getAuth,
-  signInWithPopup,
-  GoogleAuthProvider,
-  onAuthStateChanged,
-  type Auth,
-  type User,
-} from 'firebase/auth';
-import defaultFirebaseConfig from '../../firebase-applet-config.json';
 import type { CdnAsset, DriveFolder, DriveStorageQuota, DriveUser, MediaKind } from '../types/cdn';
-
-export const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
-
-interface FirebaseClientConfig {
-  apiKey: string;
-  authDomain: string;
-  projectId: string;
-  appId: string;
-  storageBucket?: string;
-  messagingSenderId?: string;
-}
-
-let activeFirebaseConfig: FirebaseClientConfig = defaultFirebaseConfig;
-let firebaseInitPromise: Promise<{ app: FirebaseApp; auth: Auth; config: FirebaseClientConfig }> | null = null;
-let cachedAuthInstance: Auth | null = null;
-
-const provider = new GoogleAuthProvider();
-for (const scope of SCOPES) {
-  provider.addScope(scope);
-}
-provider.setCustomParameters({
-  prompt: 'consent select_account',
-});
-
-async function getFirebaseAuth(): Promise<{ app: FirebaseApp; auth: Auth; config: FirebaseClientConfig }> {
-  if (!firebaseInitPromise) {
-    firebaseInitPromise = (async () => {
-      let resolvedConfig: FirebaseClientConfig = defaultFirebaseConfig;
-      try {
-        const res = await fetch('/api/firebase-config', { cache: 'no-store' });
-        if (res.ok) {
-          const data = (await res.json()) as Partial<FirebaseClientConfig>;
-          if (data.apiKey && data.authDomain && data.projectId && data.appId) {
-            resolvedConfig = {
-              apiKey: data.apiKey,
-              authDomain: data.authDomain,
-              projectId: data.projectId,
-              appId: data.appId,
-              storageBucket: data.storageBucket || '',
-              messagingSenderId: data.messagingSenderId || '',
-            };
-          }
-        }
-      } catch {
-        // Fallback to bundled firebase-applet-config.json
-      }
-
-      activeFirebaseConfig = resolvedConfig;
-      const existing = getApps()[0];
-      const app = existing ?? initializeApp(resolvedConfig);
-      const auth = getAuth(app);
-      cachedAuthInstance = auth;
-      return { app, auth, config: resolvedConfig };
-    })();
-  }
-  return firebaseInitPromise;
-}
-
-// Strict in-memory caching for access token (never localStorage or sessionStorage)
-let isSigningIn = false;
-let cachedAccessToken: string | null = null;
-
-export const initAuth = (
-  onAuthSuccess?: (user: User, token: string) => void,
-  onAuthFailure?: () => void
-) => {
-  let active = true;
-  let innerUnsub: (() => void) | null = null;
-
-  void getFirebaseAuth().then(({ auth }) => {
-    if (!active) return;
-    innerUnsub = onAuthStateChanged(auth, (user: User | null) => {
-      if (user) {
-        if (cachedAccessToken) {
-          onAuthSuccess?.(user, cachedAccessToken);
-        } else if (!isSigningIn) {
-          cachedAccessToken = null;
-          onAuthFailure?.();
-        }
-      } else {
-        cachedAccessToken = null;
-        onAuthFailure?.();
-      }
-    });
-  });
-
-  return () => {
-    active = false;
-    innerUnsub?.();
-  };
-};
-
-export const googleSignIn = async (): Promise<{ user: User; accessToken: string } | null> => {
-  const { auth, config } = await getFirebaseAuth();
-  try {
-    isSigningIn = true;
-    const result = await signInWithPopup(auth, provider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    if (!credential?.accessToken) {
-      throw new Error('Không thể nhận Access Token từ Google Auth.');
-    }
-
-    // Verify that the user actually granted Google Drive scope in the consent popup
-    const tokenInfoRes = await fetch(
-      `https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=${encodeURIComponent(credential.accessToken)}`
-    );
-    if (tokenInfoRes.ok) {
-      const info = (await tokenInfoRes.json()) as { scope?: string };
-      const grantedScopes = (info.scope || '').split(/\s+/);
-      const hasDriveScope = grantedScopes.some(
-        (s) =>
-          s === 'https://www.googleapis.com/auth/drive.file' ||
-          s === 'https://www.googleapis.com/auth/drive'
-      );
-      if (!hasDriveScope) {
-        throw new Error(
-          'Bạn chưa tích chọn quyền truy cập Google Drive trong hộp thoại đăng nhập Google. Vui lòng đăng nhập lại và cấp quyền Google Drive.'
-        );
-      }
-    }
-
-    cachedAccessToken = credential.accessToken;
-    return { user: result.user, accessToken: cachedAccessToken };
-  } catch (err: unknown) {
-    const code =
-      typeof err === 'object' && err !== null && 'code' in err
-        ? String((err as { code?: unknown }).code || '')
-        : '';
-    if (code === 'auth/unauthorized-domain') {
-      const host = typeof window !== 'undefined' ? window.location.hostname : 'domain-hien-tai';
-      throw new Error(
-        `Tên miền "${host}" chưa được thêm vào Authorized domains của Firebase project "${config.projectId}". Mở Firebase Console -> Authentication -> Settings -> Authorized domains để thêm "${host}".`
-      );
-    }
-    throw err;
-  } finally {
-    isSigningIn = false;
-  }
-};
-
-export const getAccessToken = async (): Promise<string | null> => {
-  return cachedAccessToken;
-};
-
-export const getCurrentFirebaseUser = (): User | null => {
-  return cachedAuthInstance?.currentUser ?? null;
-};
-
-export const logout = async (): Promise<void> => {
-  const { auth } = await getFirebaseAuth();
-  await auth.signOut();
-  cachedAccessToken = null;
-};
+import {
+  getActiveProjectId,
+  getFirebaseIdToken,
+} from './firebaseClient';
 
 // ---------------- Google Drive v3 API Operations ----------------
 
@@ -170,6 +11,7 @@ const DRIVE_UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3';
 const CDN_ROOT_FOLDER_NAME = 'DriveCDN';
 
 async function parseDriveError(res: Response, fallback: string): Promise<string> {
+  const projectId = getActiveProjectId();
   try {
     const data = (await res.json()) as {
       error?: {
@@ -181,10 +23,10 @@ async function parseDriveError(res: Response, fallback: string): Promise<string>
     const reason = data.error?.errors?.[0]?.reason;
     const msg = data.error?.message;
     if (reason === 'accessNotConfigured') {
-      return `Google Drive API chưa được bật trên project "${activeFirebaseConfig.projectId}". Vui lòng mở link sau và nhấn Enable (Bật): https://console.cloud.google.com/apis/library/drive.googleapis.com?project=${activeFirebaseConfig.projectId}`;
+      return `Google Drive API chưa được bật trên project "${projectId}". Vui lòng mở link sau và nhấn Enable (Bật): https://console.cloud.google.com/apis/library/drive.googleapis.com?project=${projectId}`;
     }
     if (reason === 'insufficientPermissions') {
-      return 'Tài khoản chưa được cấp đủ quyền Google Drive (drive.file). Vui lòng đăng xuất và đăng nhập lại, nhớ tích chọn quyền Google Drive.';
+      return 'Tài khoản chưa được cấp đủ quyền Google Drive (drive.file). Vui lòng ngắt kết nối và kết nối lại Google Drive, nhớ tích chọn quyền Google Drive.';
     }
     if (msg) {
       return `${fallback} (HTTP ${res.status}: ${msg})`;
@@ -283,8 +125,6 @@ export async function ensureCdnWorkspace(token: string): Promise<{
       rootFolder = await createFolder(token, CDN_ROOT_FOLDER_NAME);
     }
 
-    // Read any existing subfolders (for backwards compatibility with previously uploaded files)
-    // without creating any new folders. All new uploads go directly into the single rootFolder.
     const q = `mimeType = 'application/vnd.google-apps.folder' and '${rootFolder.id}' in parents and trashed = false`;
     const listRes = await fetch(
       `${DRIVE_API}/files?q=${encodeURIComponent(q)}&fields=files(id,name,createdTime)&orderBy=name`,
@@ -472,7 +312,7 @@ export async function uploadMediaToDrive(
   });
 }
 
-// Public visitor upload via Direct-to-Drive Resumable Session (bypasses Vercel 4.5MB limit, zero login required)
+// Authenticated user upload via Direct-to-Drive Resumable Session (bypasses Vercel 4.5MB limit)
 export async function uploadToPublicCloudRelay(
   file: File,
   bucketName: string,
@@ -480,11 +320,18 @@ export async function uploadToPublicCloudRelay(
   onProgress?: (progress: number, speedBps: number) => void
 ): Promise<CdnAsset> {
   const mimeType = file.type || 'application/octet-stream';
+  const idToken = await getFirebaseIdToken();
+  if (!idToken) {
+    throw new Error('Vui lòng đăng nhập tài khoản Google để tải tệp lên.');
+  }
 
   // Step 1: Request a single-use Google Drive resumable upload URL from server
   const sessionRes = await fetch('/api/public/upload-session', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Firebase-Id-Token': idToken,
+    },
     body: JSON.stringify({
       fileName: file.name,
       mimeType,
@@ -539,9 +386,13 @@ export async function uploadToPublicCloudRelay(
     });
 
     // Step 3: Publish file as public & register in catalog
+    const freshToken = (await getFirebaseIdToken()) || idToken;
     const completeRes = await fetch('/api/public/upload-complete', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Firebase-Id-Token': freshToken,
+      },
       body: JSON.stringify({
         fileId: uploadedFile.id,
         bucketName: session.bucketName,
@@ -565,11 +416,13 @@ export async function uploadToPublicCloudRelay(
     // Fallback via /api/public/upload if browser blocked direct CORS PUT
     if (err instanceof Error && err.message === 'DIRECT_CORS_ERROR') {
       if (file.size <= 4.5 * 1024 * 1024) {
+        const freshToken = (await getFirebaseIdToken()) || idToken;
         return new Promise<CdnAsset>((resolve, reject) => {
           const xhr = new XMLHttpRequest();
           const startTime = Date.now();
           xhr.open('POST', '/api/public/upload', true);
           xhr.setRequestHeader('Content-Type', mimeType);
+          xhr.setRequestHeader('X-Firebase-Id-Token', freshToken);
           xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
           xhr.setRequestHeader('X-File-Type', mimeType);
           xhr.setRequestHeader('X-File-Size', String(file.size));

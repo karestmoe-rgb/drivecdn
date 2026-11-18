@@ -13,12 +13,19 @@ import {
   X,
 } from 'lucide-react';
 import type { CdnAsset } from '../types/cdn';
-import { buildCdnUrls, formatBytes, formatDateVi, formatDuration } from '../lib/format';
+import {
+  buildAuthedProxyUrl,
+  buildCdnUrls,
+  formatBytes,
+  formatDateVi,
+  formatDuration,
+} from '../lib/format';
 import { ConfirmModal } from './ConfirmModal';
 
 interface AssetInspectorModalProps {
   asset: CdnAsset | null;
   canManage: boolean;
+  authToken?: string | null;
   onClose: () => void;
   onTogglePublic: (asset: CdnAsset, nextPublic: boolean) => Promise<void>;
   onRename: (asset: CdnAsset, newName: string) => Promise<void>;
@@ -28,6 +35,7 @@ interface AssetInspectorModalProps {
 export function AssetInspectorModal({
   asset,
   canManage,
+  authToken,
   onClose,
   onTogglePublic,
   onRename,
@@ -53,6 +61,7 @@ export function AssetInspectorModal({
 
   const origin = typeof window !== 'undefined' ? window.location.origin : '';
   const urls = buildCdnUrls(asset, origin);
+  const authedProxyUrl = buildAuthedProxyUrl(urls.proxyUrl, authToken);
 
   const handleCopy = async (key: string, value: string) => {
     try {
@@ -114,7 +123,7 @@ export function AssetInspectorModal({
   ];
 
   const activeImageSrc =
-    imgStage === 'google' ? urls.googleImageUrl : urls.proxyUrl;
+    imgStage === 'google' ? urls.googleImageUrl : authedProxyUrl;
 
   return (
     <div
@@ -144,7 +153,7 @@ export function AssetInspectorModal({
               {videoMode === 'html5' ? (
                 <video
                   key={asset.fileId}
-                  src={urls.proxyUrl}
+                  src={authedProxyUrl}
                   controls
                   playsInline
                   preload="metadata"

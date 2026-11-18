@@ -1,5 +1,5 @@
 import { useRef, useState, type DragEvent } from 'react';
-import { Check, Copy, Play, UploadCloud } from 'lucide-react';
+import { Check, Copy, Play, UploadCloud, UserCheck } from 'lucide-react';
 import type { CdnAsset, DriveFolder, PublicRelayStatus, UploadTask } from '../types/cdn';
 import { buildCdnUrls, formatBytes } from '../lib/format';
 
@@ -8,6 +8,8 @@ interface UploaderViewProps {
   relayStatus: PublicRelayStatus;
   ownerBuckets: DriveFolder[];
   tasks: UploadTask[];
+  currentUserName?: string;
+  currentUserEmail?: string;
   onUploadFiles: (
     files: File[],
     bucketName: string,
@@ -15,7 +17,7 @@ interface UploaderViewProps {
     uploaderName?: string
   ) => Promise<void>;
   onInspectAsset: (asset: CdnAsset) => void;
-  onGoToAdmin: () => void;
+  onGoToAdmin?: () => void;
 }
 
 export function UploaderView({
@@ -23,6 +25,8 @@ export function UploaderView({
   relayStatus,
   ownerBuckets,
   tasks,
+  currentUserName,
+  currentUserEmail,
   onUploadFiles,
   onInspectAsset,
   onGoToAdmin,
@@ -30,7 +34,6 @@ export function UploaderView({
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [selectedBucket, setSelectedBucket] = useState<string>('AUTO');
-  const [uploaderName, setUploaderName] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
@@ -51,7 +54,7 @@ export function UploaderView({
     setError(null);
 
     if (!canUpload) {
-      setError('Cổng tải lên công khai hiện đang tạm đóng. Chủ sở hữu cần kết nối Google Drive để mở.');
+      setError('Cổng lưu trữ Google Drive hiện đang tạm đóng. Vui lòng liên hệ Admin.');
       return;
     }
 
@@ -69,7 +72,7 @@ export function UploaderView({
       mediaFiles,
       chosen ? chosen.name : 'AUTO',
       chosen?.id,
-      uploaderName.trim() || undefined
+      currentUserName || currentUserEmail
     );
   };
 
@@ -81,8 +84,9 @@ export function UploaderView({
   };
 
   const handleCopyUrl = async (asset: CdnAsset) => {
-    const { proxyUrl } = buildCdnUrls(asset, window.location.origin);
-    await navigator.clipboard.writeText(proxyUrl);
+    const urls = buildCdnUrls(asset, window.location.origin);
+    const link = asset.kind === 'image' ? urls.googleImageUrl : urls.proxyUrl;
+    await navigator.clipboard.writeText(link);
     setCopiedId(asset.fileId);
     setTimeout(() => setCopiedId(null), 1800);
   };
@@ -95,7 +99,7 @@ export function UploaderView({
             Tải lên Hình ảnh &amp; Video lên Cloud
           </h1>
           <p className="mt-1 text-sm text-zinc-600">
-            Không cần đăng nhập tài khoản. Tệp tải lên được lưu trữ trực tiếp trên Google Drive của chủ sở hữu và phát lại ngay trên web.
+            Tệp tải lên được lưu trữ trực tiếp vào thư mục Google Drive chung do Admin quản lý.
           </p>
         </div>
         <div className="text-xs text-zinc-600 shrink-0">
@@ -104,7 +108,7 @@ export function UploaderView({
               Cổng Cloud đang mở{relayStatus.ownerName ? ` · ${relayStatus.ownerName}` : ''}
             </span>
           ) : (
-            <span className="font-medium text-amber-700">Cổng tải lên đang tạm đóng</span>
+            <span className="font-medium text-amber-700">Cổng lưu trữ đang tạm đóng</span>
           )}
         </div>
       </div>
@@ -113,19 +117,23 @@ export function UploaderView({
         <div className="flex flex-col justify-between gap-4 rounded-xl border border-amber-200 bg-amber-50 p-5 sm:flex-row sm:items-center">
           <div>
             <h2 className="text-sm font-semibold text-amber-950">
-              Chủ sở hữu chưa kích hoạt cổng nhận tệp công khai
+              Admin chưa kích hoạt cổng lưu trữ Google Drive
             </h2>
             <p className="mt-1 text-xs leading-relaxed text-amber-800">
-              Bạn vẫn có thể xem toàn bộ video và hình ảnh hiện có trong Thư viện Media. Nếu bạn là chủ sở hữu Google Drive, hãy vào mục Quản trị Drive để kết nối và mở cổng tải lên cho mọi người.
+              {onGoToAdmin
+                ? 'Hãy kết nối tài khoản Google Drive Host hoặc thiết lập DRIVE_BRIDGE_URL trong tab Host Google Drive để mở tải lên 24/7.'
+                : 'Vui lòng liên hệ Admin để bật cổng kết nối Google Drive trước khi tải tệp lên.'}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={onGoToAdmin}
-            className="rounded-lg bg-zinc-900 px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-zinc-800 whitespace-nowrap shrink-0"
-          >
-            Mở Quản trị Drive
-          </button>
+          {onGoToAdmin && (
+            <button
+              type="button"
+              onClick={onGoToAdmin}
+              className="rounded-lg bg-zinc-900 px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-zinc-800 whitespace-nowrap shrink-0"
+            >
+              Mở Host Google Drive
+            </button>
+          )}
         </div>
       )}
 
@@ -151,18 +159,18 @@ export function UploaderView({
         </div>
 
         <div>
-          <label htmlFor="uploader-name" className="text-xs font-medium text-zinc-700">
-            Tên người gửi (tùy chọn, không bắt buộc)
-          </label>
-          <input
-            id="uploader-name"
-            type="text"
-            value={uploaderName}
-            onChange={(e) => setUploaderName(e.target.value)}
-            placeholder="Ví dụ: Minh Anh hoặc để trống"
-            maxLength={60}
-            className="mt-2 w-full rounded-lg border border-zinc-300 px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-blue-600 focus:outline-none"
-          />
+          <div className="text-xs font-medium text-zinc-700">Tài khoản đăng tải</div>
+          <div className="mt-2 flex min-h-[38px] items-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-800">
+            <UserCheck className="h-4 w-4 shrink-0 text-emerald-600" />
+            <span className="truncate font-medium">
+              {currentUserName || currentUserEmail || 'Tài khoản đã xác thực'}
+            </span>
+            {currentUserEmail && currentUserName && currentUserName !== currentUserEmail && (
+              <span className="hidden truncate text-xs text-zinc-500 sm:inline">
+                ({currentUserEmail})
+              </span>
+            )}
+          </div>
         </div>
       </div>
 
@@ -195,7 +203,7 @@ export function UploaderView({
           Kéo thả hình ảnh hoặc video vào đây để tải lên
         </h3>
         <p className="mt-1.5 text-sm text-zinc-500">
-          Hỗ trợ PNG, JPG, WebP, GIF, SVG, MP4, WebM, MOV. Tệp sau khi tải sẽ hiển thị công khai và xem được ngay.
+          Hỗ trợ PNG, JPG, WebP, GIF, SVG, MP4, WebM, MOV. Tải trực tiếp không giới hạn 5MB.
         </p>
 
         <input

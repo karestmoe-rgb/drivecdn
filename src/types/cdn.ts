@@ -69,3 +69,21 @@ export interface UploadTask {
 }
 
 export type WorkspaceTab = 'library' | 'upload' | 'docs' | 'admin';
+
+export type WorkspacePanel = 'user' | 'admin';
+export type UserRole = 'admin' | 'user';
+export type UserStatus = 'pending' | 'approved' | 'revoked';
+
+export interface UserAccount {
+  uid: string;
+  email: string;
+  displayName: string;
+  photoURL?: string;
+  role: UserRole;
+  status: UserStatus;
+  canView: boolean;
+  canUpload: boolean;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+}
+

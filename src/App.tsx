@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Folder, HardDrive, Menu, UploadCloud, X } from 'lucide-react';
+import type { User } from 'firebase/auth';
 import type {
   CdnAsset,
   DriveFolder,
@@ -7,30 +7,33 @@ import type {
   DriveUser,
   PublicRelayStatus,
   UploadTask,
-  WorkspaceTab,
+  UserAccount,
+  WorkspacePanel,
 } from './types/cdn';
+import {
+  getCachedDriveToken,
+  getFirebaseIdToken,
+  signInAdminWithDrive,
+  signInRegularUser,
+  signOutAccount,
+  subscribeAuthUser,
+  subscribeMyUserProfile,
+  syncUserProfileOnSignIn,
+} from './lib/firebaseClient';
 import {
   createBucketFolder,
   deleteDriveFile,
   ensureCdnWorkspace,
-  getAccessToken,
-  getCurrentFirebaseUser,
   getDriveAbout,
-  googleSignIn,
-  initAuth,
   listDriveCdnFiles,
-  logout,
   makeFilePrivate,
   makeFilePublic,
   renameDriveFile,
   uploadMediaToDrive,
   uploadToPublicCloudRelay,
 } from './lib/googleDrive';
-import { formatBytes } from './lib/format';
-import { LibraryView } from './components/LibraryView';
-import { UploaderView } from './components/UploaderView';
-import { ApiDocsView } from './components/ApiDocsView';
-import { OwnerAdminView } from './components/OwnerAdminView';
+import { AdminDashboard } from './components/AdminDashboard';
+import { UserPortal } from './components/UserPortal';
 import { AssetInspectorModal } from './components/AssetInspectorModal';
 
 const INITIAL_RELAY_STATUS: PublicRelayStatus = {
@@ -40,64 +43,108 @@ const INITIAL_RELAY_STATUS: PublicRelayStatus = {
   storageQuota: null,
 };
 
-export default function App() {
-  const [activeTab, setActiveTab] = useState<WorkspaceTab>('library');
-  const [activeBucket, setActiveBucket] = useState<string>('ALL');
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+function resolvePanelFromPath(): WorkspacePanel {
+  if (typeof window !== 'undefined' && window.location.pathname.startsWith('/admin')) {
+    return 'admin';
+  }
+  return 'user';
+}
 
-  // Owner Google Drive Session
-  const [isOwnerSignedIn, setIsOwnerSignedIn] = useState(false);
+export default function App() {
+  const [panel, setPanel] = useState<WorkspacePanel>(() => resolvePanelFromPath());
+
+  // Firebase Auth & RBAC User Profile
+  const [authUser, setAuthUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [isSigningIn, setIsSigningIn] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [userProfile, setUserProfile] = useState<UserAccount | null>(null);
+  const [firebaseIdToken, setFirebaseIdToken] = useState<string | null>(null);
+
+  // Admin Google Drive Host OAuth Session
+  const [isDriveConnected, setIsDriveConnected] = useState(false);
+  const [isSigningInDrive, setIsSigningInDrive] = useState(false);
   const [driveUser, setDriveUser] = useState<DriveUser | null>(null);
   const [storageQuota, setStorageQuota] = useState<DriveStorageQuota | null>(null);
   const [rootFolder, setRootFolder] = useState<DriveFolder | null>(null);
   const [driveBuckets, setDriveBuckets] = useState<DriveFolder[]>([]);
-  const [authError, setAuthError] = useState<string | null>(null);
+  const [driveError, setDriveError] = useState<string | null>(null);
 
-  // Refs to prevent infinite useEffect / refresh loops
+  // Refs to prevent refresh loops
   const rootFolderRef = useRef<DriveFolder | null>(null);
   const isSyncingRef = useRef(false);
-  const manualSignInRef = useRef(false);
 
-  // Public Cloud Relay Status
+  // Relay Status & Media Assets
   const [relayStatus, setRelayStatus] = useState<PublicRelayStatus>(INITIAL_RELAY_STATUS);
-
-  // Media Catalog & Drive Assets
   const [publicAssets, setPublicAssets] = useState<CdnAsset[]>([]);
   const [driveAssets, setDriveAssets] = useState<CdnAsset[]>([]);
-  const [loadingAssets, setLoadingAssets] = useState(true);
+  const [loadingAssets, setLoadingAssets] = useState(false);
   const [selectedAsset, setSelectedAsset] = useState<CdnAsset | null>(null);
-
-  // Upload Queue
   const [uploadTasks, setUploadTasks] = useState<UploadTask[]>([]);
 
-  const fetchPublicData = useCallback(async () => {
-    try {
-      const [catalogRes, statusRes] = await Promise.all([
-        fetch('/api/cdn/catalog'),
-        fetch('/api/cloud/status'),
-      ]);
-      if (catalogRes.ok) {
-        const data = (await catalogRes.json()) as { items?: CdnAsset[] };
-        setPublicAssets(data.items ?? []);
+  const switchPanel = useCallback((next: WorkspacePanel) => {
+    setPanel(next);
+    if (typeof window !== 'undefined') {
+      const targetPath = next === 'admin' ? '/admin' : '/';
+      if (window.location.pathname !== targetPath) {
+        window.history.pushState({}, '', targetPath);
       }
+    }
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => {
+      setPanel(resolvePanelFromPath());
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  const fetchRelayStatus = useCallback(async () => {
+    try {
+      const statusRes = await fetch('/api/cloud/status');
       if (statusRes.ok) {
         const statusData = (await statusRes.json()) as PublicRelayStatus;
         setRelayStatus(statusData);
       }
     } catch {
-      // Ignore transient errors
+      // Non-fatal
+    }
+  }, []);
+
+  const fetchProtectedCatalog = useCallback(async () => {
+    const token = await getFirebaseIdToken();
+    if (!token) {
+      setPublicAssets([]);
+      return;
+    }
+    setFirebaseIdToken(token);
+    try {
+      const catalogRes = await fetch('/api/cdn/catalog', {
+        headers: { 'X-Firebase-Id-Token': token },
+      });
+      if (catalogRes.ok) {
+        const data = (await catalogRes.json()) as { items?: CdnAsset[] };
+        setPublicAssets(data.items ?? []);
+      } else if (catalogRes.status === 401 || catalogRes.status === 403) {
+        setPublicAssets([]);
+      }
+    } catch {
+      // Non-fatal
     }
   }, []);
 
   const activateRelayWithToken = useCallback(
-    async (token: string, rootId: string, buckets: DriveFolder[]) => {
+    async (driveToken: string, rootId: string, buckets: DriveFolder[]) => {
+      const idToken = await getFirebaseIdToken();
+      if (!idToken) return;
       try {
         const res = await fetch('/api/cloud/activate', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
+            Authorization: `Bearer ${driveToken}`,
+            'X-Firebase-Id-Token': idToken,
           },
           body: JSON.stringify({
             rootFolderId: rootId,
@@ -117,23 +164,22 @@ export default function App() {
   );
 
   const syncOwnerDriveWorkspace = useCallback(
-    async (token: string, autoEnableRelay = true) => {
+    async (driveToken: string, userHint: User | null, autoEnableRelay = true) => {
       if (isSyncingRef.current) return;
       isSyncingRef.current = true;
       setLoadingAssets(true);
-      setAuthError(null);
+      setDriveError(null);
       try {
         const [aboutResult, workspaceResult] = await Promise.allSettled([
-          getDriveAbout(token),
-          ensureCdnWorkspace(token),
+          getDriveAbout(driveToken),
+          ensureCdnWorkspace(driveToken),
         ]);
 
-        const fbUser = getCurrentFirebaseUser();
-        let resolvedUser: DriveUser | null = fbUser
+        let resolvedUser: DriveUser | null = userHint
           ? {
-              displayName: fbUser.displayName || fbUser.email || 'Chủ sở hữu Drive',
-              emailAddress: fbUser.email || '',
-              photoLink: fbUser.photoURL || undefined,
+              displayName: userHint.displayName || userHint.email || 'Admin Drive Host',
+              emailAddress: userHint.email || '',
+              photoLink: userHint.photoURL || undefined,
             }
           : null;
 
@@ -152,21 +198,21 @@ export default function App() {
           setRootFolder(workspace.rootFolder);
           setDriveBuckets(workspace.buckets);
 
-          const files = await listDriveCdnFiles(token, workspace.buckets, resolvedUser);
+          const files = await listDriveCdnFiles(driveToken, workspace.buckets, resolvedUser);
           setDriveAssets(files);
 
           if (autoEnableRelay) {
-            await activateRelayWithToken(token, workspace.rootFolder.id, workspace.buckets);
+            await activateRelayWithToken(driveToken, workspace.rootFolder.id, workspace.buckets);
           }
         } else {
           const reason =
             workspaceResult.reason instanceof Error
               ? workspaceResult.reason.message
               : 'Không thể khởi tạo thư mục DriveCDN trên Google Drive.';
-          setAuthError(reason);
+          setDriveError(reason);
         }
       } catch (err) {
-        setAuthError(err instanceof Error ? err.message : 'Không thể đồng bộ Google Drive.');
+        setDriveError(err instanceof Error ? err.message : 'Không thể đồng bộ Google Drive.');
       } finally {
         isSyncingRef.current = false;
         setLoadingAssets(false);
@@ -178,95 +224,176 @@ export default function App() {
   const refreshAll = useCallback(async () => {
     setLoadingAssets(true);
     try {
-      await fetchPublicData();
-      const token = await getAccessToken();
-      if (token) {
-        await syncOwnerDriveWorkspace(token, !rootFolderRef.current);
+      await Promise.all([fetchRelayStatus(), fetchProtectedCatalog()]);
+      const driveToken = getCachedDriveToken();
+      if (driveToken) {
+        await syncOwnerDriveWorkspace(driveToken, authUser, !rootFolderRef.current);
       }
     } finally {
       setLoadingAssets(false);
     }
-  }, [fetchPublicData, syncOwnerDriveWorkspace]);
+  }, [authUser, fetchProtectedCatalog, fetchRelayStatus, syncOwnerDriveWorkspace]);
 
-  // Mount-only initialization (prevents infinite refresh loop)
+  // Mount-only Firebase Auth & Relay Status Initialization
   useEffect(() => {
-    void refreshAll();
-    const unsub = initAuth(
-      (_user, token) => {
-        setIsOwnerSignedIn(true);
-        if (!manualSignInRef.current) {
-          void syncOwnerDriveWorkspace(token, true);
-        }
-      },
-      () => {
-        setIsOwnerSignedIn(false);
+    void fetchRelayStatus();
+    let profileUnsub: (() => void) | null = null;
+
+    const authUnsub = subscribeAuthUser((user) => {
+      profileUnsub?.();
+      profileUnsub = null;
+
+      setAuthUser(user);
+      setAuthError(null);
+
+      if (!user) {
+        setUserProfile(null);
+        setFirebaseIdToken(null);
+        setIsDriveConnected(false);
         setDriveUser(null);
         setStorageQuota(null);
         rootFolderRef.current = null;
         setRootFolder(null);
         setDriveBuckets([]);
         setDriveAssets([]);
-        setLoadingAssets(false);
+        setPublicAssets([]);
+        setSelectedAsset(null);
+        setAuthLoading(false);
+        return;
       }
-    );
-    return () => unsub();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
-  const handleOwnerLogin = async () => {
+      setAuthLoading(false);
+
+      void (async () => {
+        try {
+          const token = await user.getIdToken();
+          setFirebaseIdToken(token);
+          const synced = await syncUserProfileOnSignIn(user);
+          setUserProfile(synced);
+        } catch (err) {
+          setAuthError(
+            err instanceof Error ? err.message : 'Không thể đồng bộ hồ sơ tài khoản Google.'
+          );
+        }
+
+        profileUnsub = subscribeMyUserProfile(
+          user.uid,
+          (profile) => {
+            if (profile) {
+              setUserProfile(profile);
+            }
+          },
+          (err) => {
+            setAuthError(err.message);
+          }
+        );
+      })();
+    });
+
+    return () => {
+      authUnsub();
+      profileUnsub?.();
+    };
+  }, [fetchRelayStatus]);
+
+  // Auto-load protected catalog whenever user becomes authorized to view
+  const userCanView = Boolean(
+    userProfile &&
+      (userProfile.role === 'admin' || (userProfile.status === 'approved' && userProfile.canView))
+  );
+
+  useEffect(() => {
+    if (!authUser || !userCanView) {
+      setPublicAssets([]);
+      return;
+    }
+    setLoadingAssets(true);
+    void fetchProtectedCatalog().finally(() => setLoadingAssets(false));
+  }, [authUser, userCanView, fetchProtectedCatalog]);
+
+  // Regular User Sign-In (NO Drive OAuth scope requested)
+  const handleSignInRegularUser = async () => {
     setIsSigningIn(true);
     setAuthError(null);
-    manualSignInRef.current = true;
     try {
-      const result = await googleSignIn();
-      if (result) {
-        setIsOwnerSignedIn(true);
-        await syncOwnerDriveWorkspace(result.accessToken, true);
-      }
+      await signInRegularUser();
     } catch (err) {
       setAuthError(err instanceof Error ? err.message : 'Đăng nhập Google thất bại.');
     } finally {
-      manualSignInRef.current = false;
       setIsSigningIn(false);
     }
   };
 
-  const handleOwnerLogout = async () => {
-    const token = await getAccessToken();
-    if (token) {
+  // Admin Connect Google Drive Host (WITH Drive OAuth scope)
+  const handleConnectDriveHost = async () => {
+    setIsSigningInDrive(true);
+    setAuthError(null);
+    setDriveError(null);
+    try {
+      const { user, accessToken } = await signInAdminWithDrive();
+      const profile = await syncUserProfileOnSignIn(user);
+      setUserProfile(profile);
+      setFirebaseIdToken(await user.getIdToken());
+
+      if (profile.role !== 'admin') {
+        setIsDriveConnected(false);
+        setAuthError(
+          `Tài khoản ${profile.email} không có quyền Admin để quản trị Google Drive Host.`
+        );
+        return;
+      }
+
+      setIsDriveConnected(true);
+      await syncOwnerDriveWorkspace(accessToken, user, true);
+      await fetchProtectedCatalog();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Kết nối Google Drive Host thất bại.';
+      setAuthError(msg);
+      setDriveError(msg);
+    } finally {
+      setIsSigningInDrive(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    const driveToken = getCachedDriveToken();
+    const idToken = await getFirebaseIdToken();
+    if (driveToken && idToken && userProfile?.role === 'admin') {
       await fetch('/api/cloud/deactivate', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
+        headers: {
+          Authorization: `Bearer ${driveToken}`,
+          'X-Firebase-Id-Token': idToken,
+        },
       }).catch(() => undefined);
     }
-    await logout();
-    setIsOwnerSignedIn(false);
-    setDriveUser(null);
-    setStorageQuota(null);
-    rootFolderRef.current = null;
-    setRootFolder(null);
-    setDriveBuckets([]);
-    setDriveAssets([]);
+    await signOutAccount();
     setSelectedAsset(null);
-    await fetchPublicData();
+    await fetchRelayStatus();
   };
 
   const handleToggleRelay = async (enabled: boolean) => {
-    const token = await getAccessToken();
-    if (!token) throw new Error('Vui lòng đăng nhập Google Drive trước.');
+    const driveToken = getCachedDriveToken();
+    const idToken = await getFirebaseIdToken();
+    if (!driveToken) throw new Error('Vui lòng kết nối Google Drive Host trước.');
+    if (!idToken) throw new Error('Phiên đăng nhập Admin đã hết hạn.');
+
     if (!enabled) {
       const res = await fetch('/api/cloud/deactivate', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
+        headers: {
+          Authorization: `Bearer ${driveToken}`,
+          'X-Firebase-Id-Token': idToken,
+        },
       });
       if (res.ok) setRelayStatus((prev) => ({ ...prev, enabled: false, active: false }));
       return;
     }
     if (!rootFolder || driveBuckets.length === 0) {
-      await syncOwnerDriveWorkspace(token, true);
+      await syncOwnerDriveWorkspace(driveToken, authUser, true);
       return;
     }
-    await activateRelayWithToken(token, rootFolder.id, driveBuckets);
+    await activateRelayWithToken(driveToken, rootFolder.id, driveBuckets);
   };
 
   const mergedAssets = useMemo(() => {
@@ -299,17 +426,24 @@ export default function App() {
     return Array.from(set).sort();
   }, [driveBuckets, relayStatus.buckets, mergedAssets]);
 
-  const registerInPublicCatalog = async (token: string, asset: CdnAsset): Promise<CdnAsset> => {
+  const registerInPublicCatalog = async (
+    driveToken: string,
+    asset: CdnAsset
+  ): Promise<CdnAsset> => {
+    const idToken = await getFirebaseIdToken();
+    if (!idToken) throw new Error('Phiên đăng nhập Admin không hợp lệ.');
+
     const res = await fetch('/api/cdn/catalog', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${driveToken}`,
+        'X-Firebase-Id-Token': idToken,
       },
       body: JSON.stringify(asset),
     });
     if (!res.ok) {
-      const err = (await res.json()) as { error?: string };
+      const err = (await res.json().catch(() => ({}))) as { error?: string };
       throw new Error(err.error || 'Không thể đăng ký tệp vào danh mục công khai.');
     }
     const data = (await res.json()) as { item: CdnAsset };
@@ -344,7 +478,7 @@ export default function App() {
 
     setUploadTasks((prev) => [...newTasks, ...prev]);
 
-    const token = await getAccessToken();
+    const driveToken = getCachedDriveToken();
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
@@ -359,10 +493,16 @@ export default function App() {
 
         const useBridgeRelay = relayStatus.active && relayStatus.mode === 'bridge';
 
-        if (token && isOwnerSignedIn && !useBridgeRelay) {
+        if (
+          panel === 'admin' &&
+          userProfile?.role === 'admin' &&
+          driveToken &&
+          isDriveConnected &&
+          !useBridgeRelay
+        ) {
           let activeRoot = rootFolder || rootFolderRef.current;
           if (!activeRoot) {
-            const ws = await ensureCdnWorkspace(token);
+            const ws = await ensureCdnWorkspace(driveToken);
             rootFolderRef.current = ws.rootFolder;
             setRootFolder(ws.rootFolder);
             setDriveBuckets(ws.buckets);
@@ -378,14 +518,19 @@ export default function App() {
             throw new Error('Không tìm thấy thư mục lưu trữ trên Google Drive.');
           }
 
-          const uploaded = await uploadMediaToDrive(token, file, targetFolderId, (progress, speedBps) => {
-            updateTask({ progress, speedBps });
-          });
+          const uploaded = await uploadMediaToDrive(
+            driveToken,
+            file,
+            targetFolderId,
+            (progress, speedBps) => {
+              updateTask({ progress, speedBps });
+            }
+          );
 
           updateTask({ status: 'publishing', progress: 100 });
-          await makeFilePublic(token, uploaded.id);
+          await makeFilePublic(driveToken, uploaded.id);
 
-          const asset = await registerInPublicCatalog(token, {
+          const asset = await registerInPublicCatalog(driveToken, {
             fileId: uploaded.id,
             name: uploaded.name || file.name,
             mimeType: uploaded.mimeType || file.type,
@@ -402,7 +547,7 @@ export default function App() {
             webViewLink: uploaded.webViewLink,
             isPublic: true,
             createdTime: uploaded.createdTime || new Date().toISOString(),
-            uploadedBy: uploaderName || driveUser?.displayName || 'Chủ sở hữu',
+            uploadedBy: uploaderName || driveUser?.displayName || userProfile.displayName,
             ownerName: driveUser?.displayName,
             ownerEmail: driveUser?.emailAddress,
           });
@@ -433,30 +578,37 @@ export default function App() {
   };
 
   const handleCreateBucket = async (name: string): Promise<DriveFolder | null> => {
-    const token = await getAccessToken();
-    if (!token || !rootFolder) return null;
-    const created = await createBucketFolder(token, rootFolder.id, name);
+    const driveToken = getCachedDriveToken();
+    if (!driveToken || !rootFolder) return null;
+    const created = await createBucketFolder(driveToken, rootFolder.id, name);
     const nextBuckets = [...driveBuckets, created];
     setDriveBuckets(nextBuckets);
     if (relayStatus.active) {
-      await activateRelayWithToken(token, rootFolder.id, nextBuckets);
+      await activateRelayWithToken(driveToken, rootFolder.id, nextBuckets);
     }
     return created;
   };
 
+  // Admin-only Media Mutations
   const handleTogglePublic = async (asset: CdnAsset, nextPublic: boolean) => {
-    const token = await getAccessToken();
-    if (!token) throw new Error('Cần đăng nhập chủ sở hữu để thay đổi quyền.');
+    const driveToken = getCachedDriveToken();
+    const idToken = await getFirebaseIdToken();
+    if (!driveToken || !idToken || userProfile?.role !== 'admin') {
+      throw new Error('Cần kết nối Google Drive Host bằng tài khoản Admin để thay đổi quyền.');
+    }
 
     if (nextPublic) {
-      await makeFilePublic(token, asset.fileId);
-      const updated = await registerInPublicCatalog(token, { ...asset, isPublic: true });
+      await makeFilePublic(driveToken, asset.fileId);
+      const updated = await registerInPublicCatalog(driveToken, { ...asset, isPublic: true });
       setSelectedAsset(updated);
     } else {
-      await makeFilePrivate(token, asset.fileId);
+      await makeFilePrivate(driveToken, asset.fileId);
       await fetch(`/api/cdn/catalog/${encodeURIComponent(asset.fileId)}`, {
         method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` },
+        headers: {
+          Authorization: `Bearer ${driveToken}`,
+          'X-Firebase-Id-Token': idToken,
+        },
       });
       setSelectedAsset({ ...asset, isPublic: false });
     }
@@ -464,16 +616,20 @@ export default function App() {
   };
 
   const handleRenameAsset = async (asset: CdnAsset, newName: string) => {
-    const token = await getAccessToken();
-    if (!token) throw new Error('Cần đăng nhập chủ sở hữu để đổi tên tệp.');
+    const driveToken = getCachedDriveToken();
+    const idToken = await getFirebaseIdToken();
+    if (!driveToken || !idToken || userProfile?.role !== 'admin') {
+      throw new Error('Cần kết nối Google Drive Host bằng tài khoản Admin để đổi tên tệp.');
+    }
 
-    await renameDriveFile(token, asset.fileId, newName);
+    await renameDriveFile(driveToken, asset.fileId, newName);
     if (asset.isPublic) {
       await fetch(`/api/cdn/catalog/${encodeURIComponent(asset.fileId)}`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
+          Authorization: `Bearer ${driveToken}`,
+          'X-Firebase-Id-Token': idToken,
         },
         body: JSON.stringify({ name: newName }),
       });
@@ -483,353 +639,88 @@ export default function App() {
   };
 
   const handleDeleteAsset = async (asset: CdnAsset) => {
-    const token = await getAccessToken();
-    if (!token) throw new Error('Cần đăng nhập chủ sở hữu để xóa tệp.');
+    const driveToken = getCachedDriveToken();
+    const idToken = await getFirebaseIdToken();
+    if (!driveToken || !idToken || userProfile?.role !== 'admin') {
+      throw new Error('Cần kết nối Google Drive Host bằng tài khoản Admin để xóa tệp.');
+    }
 
-    await deleteDriveFile(token, asset.fileId);
+    await deleteDriveFile(driveToken, asset.fileId);
     await fetch(`/api/cdn/catalog/${encodeURIComponent(asset.fileId)}`, {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` },
+      headers: {
+        Authorization: `Bearer ${driveToken}`,
+        'X-Firebase-Id-Token': idToken,
+      },
     });
     await refreshAll();
   };
 
-  const canManageAsset = (asset: CdnAsset) => {
-    if (!isOwnerSignedIn) return false;
-    if (!asset.ownerEmail || !driveUser?.emailAddress) return true;
-    return asset.ownerEmail === driveUser.emailAddress;
-  };
-
-  const activeQuota = storageQuota || relayStatus.storageQuota;
-  const quotaPct =
-    activeQuota && activeQuota.limit > 0
-      ? Math.min(100, Math.round((activeQuota.usage / activeQuota.limit) * 100))
-      : 0;
-  const totalCatalogBytes = publicAssets.reduce((sum, item) => sum + (item.size || 0), 0);
-
-  const navItems: { id: WorkspaceTab; label: string }[] = [
-    { id: 'library', label: 'Thư viện Media' },
-    { id: 'upload', label: 'Tải lên Cloud' },
-    { id: 'docs', label: 'Nhúng & Vercel' },
-    { id: 'admin', label: 'Quản trị Drive' },
-  ];
+  const canManageSelectedAsset =
+    panel === 'admin' && userProfile?.role === 'admin' && isDriveConnected;
 
   return (
-    <div className="min-h-screen overflow-x-hidden bg-zinc-50 text-zinc-900">
-      {/* Top Bar Contract: 3 zones separated by gap-8 (compact 56px on mobile to stay well within 15% sticky cap) */}
-      <header className="sticky top-0 z-30 border-b border-zinc-200 bg-white">
-        <div className="mx-auto flex h-14 max-w-[1440px] items-center justify-between gap-4 px-4 sm:h-16 sm:gap-8 sm:px-6">
-          {/* Zone 1: Single text element wordmark */}
-          <button
-            type="button"
-            onClick={() => setActiveTab('library')}
-            className="font-display text-lg font-bold tracking-tight text-zinc-900 whitespace-nowrap shrink-0"
-          >
-            DriveCDN
-          </button>
-
-          {/* Zone 2: 4 concise single-line nav links */}
-          <nav className="hidden items-center gap-7 md:flex" aria-label="Điều hướng chính">
-            {navItems.map((nav) => (
-              <button
-                key={nav.id}
-                type="button"
-                onClick={() => setActiveTab(nav.id)}
-                className={`border-b-2 py-5 text-sm font-medium transition-colors whitespace-nowrap shrink-0 ${
-                  activeTab === nav.id
-                    ? 'border-blue-600 text-zinc-900'
-                    : 'border-transparent text-zinc-600 hover:border-zinc-300 hover:text-zinc-900'
-                }`}
-              >
-                {nav.label}
-              </button>
-            ))}
-          </nav>
-
-          {/* Zone 3: 1 primary action */}
-          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
-            <button
-              type="button"
-              onClick={() => setActiveTab('upload')}
-              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-blue-600 px-3.5 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-700 whitespace-nowrap shrink-0"
-            >
-              <UploadCloud className="h-3.5 w-3.5" />
-              <span>Tải lên ngay</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setMobileMenuOpen((v) => !v)}
-              aria-label="Mở menu điều hướng"
-              className="flex h-10 w-10 items-center justify-center rounded-lg border border-zinc-200 text-zinc-700 md:hidden"
-            >
-              {mobileMenuOpen ? <X className="h-4 w-4" /> : <Menu className="h-4 w-4" />}
-            </button>
-          </div>
-        </div>
-
-        {/* Mobile Navigation Drawer */}
-        {mobileMenuOpen && (
-          <div className="border-t border-zinc-200 bg-white px-4 py-3 md:hidden">
-            <div className="grid grid-cols-2 gap-2">
-              {navItems.map((nav) => (
-                <button
-                  key={nav.id}
-                  type="button"
-                  onClick={() => {
-                    setActiveTab(nav.id);
-                    setMobileMenuOpen(false);
-                  }}
-                  className={`min-h-[44px] rounded-lg px-3 py-2 text-left text-sm font-medium ${
-                    activeTab === nav.id
-                      ? 'bg-zinc-900 text-white'
-                      : 'border border-zinc-200 bg-zinc-50 text-zinc-700'
-                  }`}
-                >
-                  {nav.label}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-      </header>
-
-      {/* Mobile Horizontal Bucket Strip (visible < lg so main content stays above the fold!) */}
-      {activeTab === 'library' && (
-        <div className="border-b border-zinc-200 bg-white px-4 py-2.5 lg:hidden">
-          <div className="flex items-center gap-2 overflow-x-auto no-scrollbar">
-            <button
-              type="button"
-              onClick={() => setActiveBucket('ALL')}
-              className={`min-h-[38px] rounded-lg px-3 py-1.5 text-xs font-medium whitespace-nowrap shrink-0 ${
-                activeBucket === 'ALL'
-                  ? 'bg-zinc-900 text-white'
-                  : 'bg-zinc-100 text-zinc-700'
-              }`}
-            >
-              Tất cả ({mergedAssets.length})
-            </button>
-            {bucketNames.map((bucket) => {
-              const count = mergedAssets.filter((a) => a.bucket === bucket).length;
-              return (
-                <button
-                  key={bucket}
-                  type="button"
-                  onClick={() => setActiveBucket(bucket)}
-                  className={`min-h-[38px] rounded-lg px-3 py-1.5 text-xs font-medium whitespace-nowrap shrink-0 ${
-                    activeBucket === bucket
-                      ? 'bg-zinc-900 text-white'
-                      : 'bg-zinc-100 text-zinc-700'
-                  }`}
-                >
-                  {bucket} ({count})
-                </button>
-              );
-            })}
-          </div>
-        </div>
+    <>
+      {panel === 'admin' ? (
+        <AdminDashboard
+          authUser={authUser}
+          authLoading={authLoading}
+          isSigningIn={isSigningIn}
+          authError={authError}
+          userProfile={userProfile}
+          firebaseIdToken={firebaseIdToken}
+          isDriveConnected={isDriveConnected}
+          isSigningInDrive={isSigningInDrive}
+          driveUser={driveUser}
+          storageQuota={storageQuota}
+          buckets={driveBuckets}
+          bucketNames={bucketNames}
+          relayStatus={relayStatus}
+          assets={mergedAssets}
+          loadingAssets={loadingAssets}
+          uploadTasks={uploadTasks}
+          driveError={driveError}
+          onSignInAdminGoogle={handleSignInRegularUser}
+          onConnectDriveHost={handleConnectDriveHost}
+          onSignOut={handleSignOut}
+          onSwitchToUserPortal={() => switchPanel('user')}
+          onRefreshAssets={() => void refreshAll()}
+          onInspectAsset={(asset) => setSelectedAsset(asset)}
+          onUploadFiles={handleUploadFiles}
+          onToggleRelay={handleToggleRelay}
+          onCreateBucket={handleCreateBucket}
+        />
+      ) : (
+        <UserPortal
+          authUser={authUser}
+          authLoading={authLoading}
+          isSigningIn={isSigningIn}
+          authError={authError}
+          userProfile={userProfile}
+          firebaseIdToken={firebaseIdToken}
+          relayStatus={relayStatus}
+          assets={mergedAssets}
+          loadingAssets={loadingAssets}
+          bucketNames={bucketNames}
+          uploadTasks={uploadTasks}
+          onSignInUser={handleSignInRegularUser}
+          onSignOut={handleSignOut}
+          onSwitchToAdmin={() => switchPanel('admin')}
+          onRefreshAssets={() => void refreshAll()}
+          onInspectAsset={(asset) => setSelectedAsset(asset)}
+          onUploadFiles={handleUploadFiles}
+        />
       )}
 
-      {/* Workspace Shell (Main first on mobile, Sidebar second on mobile / left on desktop) */}
-      <div className="mx-auto flex max-w-[1440px] flex-col-reverse gap-6 px-4 py-5 sm:px-6 sm:py-8 lg:flex-row lg:gap-8">
-        {/* Sidebar (260px on desktop, compact bottom summary on mobile) */}
-        <aside className="w-full shrink-0 space-y-5 lg:w-[260px]">
-          <div className="rounded-xl border border-zinc-200 bg-white p-5">
-            <div className="flex items-center gap-2 text-xs font-semibold text-zinc-900">
-              <HardDrive className="h-4 w-4 text-blue-600" />
-              Dung lượng Cloud Google Drive
-            </div>
-
-            {activeQuota ? (
-              <div className="mt-3 space-y-2.5">
-                <div className="flex items-baseline justify-between text-xs tabular-nums">
-                  <span className="font-semibold text-zinc-900">
-                    {formatBytes(activeQuota.usage)}
-                  </span>
-                  <span className="text-zinc-500">
-                    / {activeQuota.limit > 0 ? formatBytes(activeQuota.limit) : 'Không giới hạn'}
-                  </span>
-                </div>
-                <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-100">
-                  <div className="h-full bg-blue-600 transition-all" style={{ width: `${quotaPct}%` }} />
-                </div>
-                <div className="text-xs text-zinc-500 tabular-nums">
-                  Đã dùng {quotaPct}% · {publicAssets.length} tệp công khai
-                </div>
-              </div>
-            ) : (
-              <div className="mt-3 space-y-2 text-xs text-zinc-600 tabular-nums">
-                <div className="flex items-center justify-between">
-                  <span>Tệp đang lưu trữ</span>
-                  <span className="font-mono font-semibold text-zinc-900">{publicAssets.length}</span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span>Tổng dung lượng tệp</span>
-                  <span className="font-mono font-semibold text-zinc-900">
-                    {formatBytes(totalCatalogBytes)}
-                  </span>
-                </div>
-              </div>
-            )}
-
-            <div className="mt-4 border-t border-zinc-100 pt-3 text-xs">
-              <div className="flex items-center justify-between">
-                <span className="text-zinc-500">Tải lên công khai</span>
-                <span className={relayStatus.active ? 'font-medium text-emerald-700' : 'font-medium text-amber-700'}>
-                  {relayStatus.active ? 'Đang mở' : 'Tạm đóng'}
-                </span>
-              </div>
-              {relayStatus.active ? (
-                <p className="mt-1.5 text-[11px] text-zinc-500">
-                  Khách truy cập tải ảnh &amp; video tự do, không cần đăng nhập.
-                </p>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => setActiveTab('admin')}
-                  className="mt-2.5 w-full rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-left text-[11px] font-medium text-zinc-700 hover:bg-zinc-100"
-                >
-                  Chủ sở hữu: Kết nối Drive tại Quản trị →
-                </button>
-              )}
-            </div>
-          </div>
-
-          {/* Desktop Bucket Navigation */}
-          <div className="hidden rounded-xl border border-zinc-200 bg-white p-3 lg:block">
-            <div className="px-2.5 py-1.5 text-xs font-semibold text-zinc-500">
-              Thư mục (Buckets)
-            </div>
-            <div className="mt-1 space-y-0.5">
-              <button
-                type="button"
-                onClick={() => {
-                  setActiveBucket('ALL');
-                  setActiveTab('library');
-                }}
-                className={`flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left text-xs font-medium transition-colors ${
-                  activeBucket === 'ALL' && activeTab === 'library'
-                    ? 'bg-zinc-100 text-zinc-900'
-                    : 'text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900'
-                }`}
-              >
-                <span className="flex items-center gap-2 truncate">
-                  <Folder className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
-                  Tất cả tệp
-                </span>
-                <span className="font-mono text-[11px] text-zinc-500 tabular-nums">
-                  {mergedAssets.length}
-                </span>
-              </button>
-
-              {bucketNames.map((bucket) => {
-                const count = mergedAssets.filter((a) => a.bucket === bucket).length;
-                return (
-                  <button
-                    key={bucket}
-                    type="button"
-                    onClick={() => {
-                      setActiveBucket(bucket);
-                      setActiveTab('library');
-                    }}
-                    className={`flex w-full items-center justify-between rounded-lg px-2.5 py-2 text-left text-xs font-medium transition-colors ${
-                      activeBucket === bucket && activeTab === 'library'
-                        ? 'bg-zinc-100 text-zinc-900'
-                        : 'text-zinc-600 hover:bg-zinc-50 hover:text-zinc-900'
-                    }`}
-                  >
-                    <span className="flex items-center gap-2 truncate">
-                      <Folder className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
-                      <span className="truncate">{bucket}</span>
-                    </span>
-                    <span className="font-mono text-[11px] text-zinc-500 tabular-nums">{count}</span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {authError && (
-            <div className="space-y-2 rounded-xl border border-red-200 bg-red-50 p-4 text-xs leading-relaxed text-red-700 break-words">
-              <p>{authError.replace(/https:\/\/\S+/g, '').trim()}</p>
-              {authError.match(/https:\/\/\S+/) && (
-                <a
-                  href={authError.match(/https:\/\/\S+/)?.[0]}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-block font-semibold text-blue-700 underline hover:text-blue-800"
-                >
-                  Mở Google Cloud Console để bật Drive API
-                </a>
-              )}
-              {isOwnerSignedIn && (
-                <button
-                  type="button"
-                  onClick={() => void refreshAll()}
-                  className="block min-h-[36px] rounded-md border border-red-300 bg-white px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-100"
-                >
-                  Thử kết nối lại Drive
-                </button>
-              )}
-            </div>
-          )}
-        </aside>
-
-        {/* Main Viewport */}
-        <main className="min-w-0 flex-1">
-          {activeTab === 'library' && (
-            <LibraryView
-              assets={mergedAssets}
-              loading={loadingAssets}
-              isOwnerSignedIn={isOwnerSignedIn}
-              activeBucket={activeBucket}
-              onRefresh={() => void refreshAll()}
-              onInspect={(asset) => setSelectedAsset(asset)}
-              onGoToUpload={() => setActiveTab('upload')}
-              onGoToDocs={() => setActiveTab('docs')}
-            />
-          )}
-
-          {activeTab === 'upload' && (
-            <UploaderView
-              isOwnerSignedIn={isOwnerSignedIn}
-              relayStatus={relayStatus}
-              ownerBuckets={driveBuckets}
-              tasks={uploadTasks}
-              onUploadFiles={handleUploadFiles}
-              onInspectAsset={(asset) => setSelectedAsset(asset)}
-              onGoToAdmin={() => setActiveTab('admin')}
-            />
-          )}
-
-          {activeTab === 'docs' && <ApiDocsView sampleAsset={publicAssets[0] || mergedAssets[0]} />}
-
-          {activeTab === 'admin' && (
-            <OwnerAdminView
-              isAuthenticated={isOwnerSignedIn}
-              isSigningIn={isSigningIn}
-              driveUser={driveUser}
-              storageQuota={storageQuota}
-              buckets={driveBuckets}
-              relayStatus={relayStatus}
-              onSignIn={() => void handleOwnerLogin()}
-              onSignOut={() => void handleOwnerLogout()}
-              onToggleRelay={handleToggleRelay}
-              onCreateBucket={handleCreateBucket}
-            />
-          )}
-        </main>
-      </div>
-
-      {/* Asset Inspector / Video & Image Viewer Modal */}
       <AssetInspectorModal
         asset={selectedAsset}
-        canManage={selectedAsset ? canManageAsset(selectedAsset) : false}
+        canManage={canManageSelectedAsset}
+        authToken={firebaseIdToken}
         onClose={() => setSelectedAsset(null)}
         onTogglePublic={handleTogglePublic}
         onRename={handleRenameAsset}
         onDelete={handleDeleteAsset}
       />
-    </div>
+    </>
   );
 }

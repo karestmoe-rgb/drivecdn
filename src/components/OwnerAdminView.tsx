@@ -125,10 +125,10 @@ export function OwnerAdminView({
     <div className="space-y-6">
       <div className="border-b border-zinc-200 pb-5">
         <h1 className="text-xl font-semibold text-zinc-900">
-          Quản trị Google Drive (Dành cho chủ sở hữu)
+          Host Google Drive (Dành cho Admin)
         </h1>
         <p className="mt-1 text-sm text-zinc-600">
-          Kết nối tài khoản Google Drive của bạn để cấp dung lượng lưu trữ và mở cổng cho phép khách tải lên mà không cần đăng nhập.
+          Kết nối tài khoản Google Drive chủ sở hữu để cấp dung lượng lưu trữ, xóa/quản lý tệp và mở cổng tải lên cho User đã được duyệt.
         </p>
       </div>
 
@@ -138,7 +138,7 @@ export function OwnerAdminView({
             Cổng Drive vĩnh viễn 24/7 đang hoạt động ({relayStatus.ownerEmail || 'DRIVE_BRIDGE_URL'})
           </div>
           <p className="mt-1 text-xs leading-relaxed text-emerald-800">
-            Mọi ảnh &amp; video do khách tải lên sẽ được lưu tập trung vào 1 thư mục cố định duy nhất trên Drive
+            Mọi ảnh &amp; video do Admin và User được cấp quyền tải lên sẽ được lưu tập trung vào 1 thư mục cố định duy nhất trên Drive
             {relayStatus.rootFolderId ? (
               <>
                 {' '}
@@ -209,21 +209,21 @@ export function OwnerAdminView({
 
             <div>
               <h3 className="text-sm font-semibold text-zinc-900">
-                Cổng tải lên công khai (Public Cloud Relay)
+                Cổng lưu trữ Google Drive (Cloud Relay)
               </h3>
               <p className="mt-1 text-xs leading-relaxed text-zinc-600">
-                Khi bật, bất kỳ ai truy cập web app này đều có thể tải video và hình ảnh thẳng vào thư mục <span className="font-mono text-zinc-800">DriveCDN</span> trên Google Drive của bạn mà không cần đăng nhập.
+                Khi bật, các tài khoản Google đã được Admin cấp quyền tải lên trong tab Quản lý User có thể tải ảnh và video thẳng vào thư mục <span className="font-mono text-zinc-800">DriveCDN</span> của bạn.
               </p>
 
               <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-zinc-200 bg-zinc-50 p-4">
                 <div className="text-xs">
                   <div className="font-semibold text-zinc-900">
-                    {relayStatus.active ? 'Đang mở cho người dùng công khai' : 'Đang tạm đóng'}
+                    {relayStatus.active ? 'Đang mở cho User đã cấp quyền' : 'Đang tạm đóng'}
                   </div>
                   <div className="mt-0.5 text-zinc-500 tabular-nums">
                     {relayStatus.active
                       ? `Phiên kết nối hiện tại còn hiệu lực ~${minutesRemaining} phút`
-                      : 'Nhấn Bật cổng tải lên để cho phép khách gửi tệp'}
+                      : 'Nhấn Bật cổng tải lên để cho phép User được duyệt gửi tệp'}
                   </div>
                 </div>
 
