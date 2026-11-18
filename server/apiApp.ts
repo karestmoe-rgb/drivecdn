@@ -509,6 +509,49 @@ export function createApiApp(): Express {
     });
   });
 
+  // Runtime Firebase public Web SDK configuration (avoids VITE_ build-time env var warnings on Vercel)
+  app.get('/api/firebase-config', (_req: Request, res: Response) => {
+    const apiKey = process.env.FIREBASE_API_KEY;
+    const authDomain = process.env.FIREBASE_AUTH_DOMAIN;
+    const projectId = process.env.FIREBASE_PROJECT_ID;
+    const appId = process.env.FIREBASE_APP_ID;
+
+    if (apiKey && authDomain && projectId && appId) {
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        apiKey,
+        authDomain,
+        projectId,
+        appId,
+        storageBucket: process.env.FIREBASE_STORAGE_BUCKET || '',
+        messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '',
+      });
+      return;
+    }
+
+    try {
+      const cfgPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+      if (fs.existsSync(cfgPath)) {
+        const raw = fs.readFileSync(cfgPath, 'utf-8');
+        const parsed = JSON.parse(raw) as Record<string, string>;
+        res.setHeader('Cache-Control', 'no-store');
+        res.json({
+          apiKey: parsed.apiKey || '',
+          authDomain: parsed.authDomain || '',
+          projectId: parsed.projectId || '',
+          appId: parsed.appId || '',
+          storageBucket: parsed.storageBucket || '',
+          messagingSenderId: parsed.messagingSenderId || '',
+        });
+        return;
+      }
+    } catch {
+      // Ignore fallback read failure
+    }
+
+    res.status(404).json({ error: 'Chưa cấu hình Firebase Auth.' });
+  });
+
   // Vercel-friendly Direct-to-Drive Resumable Upload Session (bypasses 4.5MB serverless limit!)
   app.post('/api/public/upload-session', async (req: Request, res: Response) => {
     const relay = await getActiveRelay();

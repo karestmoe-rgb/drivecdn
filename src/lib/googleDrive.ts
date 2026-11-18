@@ -1,18 +1,29 @@
-import { initializeApp } from 'firebase/app';
+import { initializeApp, getApps, type FirebaseApp } from 'firebase/app';
 import {
   getAuth,
   signInWithPopup,
   GoogleAuthProvider,
   onAuthStateChanged,
+  type Auth,
   type User,
 } from 'firebase/auth';
-import firebaseConfig from '../../firebase-applet-config.json';
+import defaultFirebaseConfig from '../../firebase-applet-config.json';
 import type { CdnAsset, DriveFolder, DriveStorageQuota, DriveUser, MediaKind } from '../types/cdn';
 
 export const SCOPES = ['https://www.googleapis.com/auth/drive.file'];
 
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
+interface FirebaseClientConfig {
+  apiKey: string;
+  authDomain: string;
+  projectId: string;
+  appId: string;
+  storageBucket?: string;
+  messagingSenderId?: string;
+}
+
+let activeFirebaseConfig: FirebaseClientConfig = defaultFirebaseConfig;
+let firebaseInitPromise: Promise<{ app: FirebaseApp; auth: Auth; config: FirebaseClientConfig }> | null = null;
+let cachedAuthInstance: Auth | null = null;
 
 const provider = new GoogleAuthProvider();
 for (const scope of SCOPES) {
@@ -22,6 +33,40 @@ provider.setCustomParameters({
   prompt: 'consent select_account',
 });
 
+async function getFirebaseAuth(): Promise<{ app: FirebaseApp; auth: Auth; config: FirebaseClientConfig }> {
+  if (!firebaseInitPromise) {
+    firebaseInitPromise = (async () => {
+      let resolvedConfig: FirebaseClientConfig = defaultFirebaseConfig;
+      try {
+        const res = await fetch('/api/firebase-config', { cache: 'no-store' });
+        if (res.ok) {
+          const data = (await res.json()) as Partial<FirebaseClientConfig>;
+          if (data.apiKey && data.authDomain && data.projectId && data.appId) {
+            resolvedConfig = {
+              apiKey: data.apiKey,
+              authDomain: data.authDomain,
+              projectId: data.projectId,
+              appId: data.appId,
+              storageBucket: data.storageBucket || '',
+              messagingSenderId: data.messagingSenderId || '',
+            };
+          }
+        }
+      } catch {
+        // Fallback to bundled firebase-applet-config.json
+      }
+
+      activeFirebaseConfig = resolvedConfig;
+      const existing = getApps()[0];
+      const app = existing ?? initializeApp(resolvedConfig);
+      const auth = getAuth(app);
+      cachedAuthInstance = auth;
+      return { app, auth, config: resolvedConfig };
+    })();
+  }
+  return firebaseInitPromise;
+}
+
 // Strict in-memory caching for access token (never localStorage or sessionStorage)
 let isSigningIn = false;
 let cachedAccessToken: string | null = null;
@@ -30,22 +75,34 @@ export const initAuth = (
   onAuthSuccess?: (user: User, token: string) => void,
   onAuthFailure?: () => void
 ) => {
-  return onAuthStateChanged(auth, (user: User | null) => {
-    if (user) {
-      if (cachedAccessToken) {
-        onAuthSuccess?.(user, cachedAccessToken);
-      } else if (!isSigningIn) {
+  let active = true;
+  let innerUnsub: (() => void) | null = null;
+
+  void getFirebaseAuth().then(({ auth }) => {
+    if (!active) return;
+    innerUnsub = onAuthStateChanged(auth, (user: User | null) => {
+      if (user) {
+        if (cachedAccessToken) {
+          onAuthSuccess?.(user, cachedAccessToken);
+        } else if (!isSigningIn) {
+          cachedAccessToken = null;
+          onAuthFailure?.();
+        }
+      } else {
         cachedAccessToken = null;
         onAuthFailure?.();
       }
-    } else {
-      cachedAccessToken = null;
-      onAuthFailure?.();
-    }
+    });
   });
+
+  return () => {
+    active = false;
+    innerUnsub?.();
+  };
 };
 
 export const googleSignIn = async (): Promise<{ user: User; accessToken: string } | null> => {
+  const { auth, config } = await getFirebaseAuth();
   try {
     isSigningIn = true;
     const result = await signInWithPopup(auth, provider);
@@ -75,6 +132,18 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
 
     cachedAccessToken = credential.accessToken;
     return { user: result.user, accessToken: cachedAccessToken };
+  } catch (err: unknown) {
+    const code =
+      typeof err === 'object' && err !== null && 'code' in err
+        ? String((err as { code?: unknown }).code || '')
+        : '';
+    if (code === 'auth/unauthorized-domain') {
+      const host = typeof window !== 'undefined' ? window.location.hostname : 'domain-hien-tai';
+      throw new Error(
+        `Tên miền "${host}" chưa được thêm vào Authorized domains của Firebase project "${config.projectId}". Mở Firebase Console -> Authentication -> Settings -> Authorized domains để thêm "${host}".`
+      );
+    }
+    throw err;
   } finally {
     isSigningIn = false;
   }
@@ -85,10 +154,11 @@ export const getAccessToken = async (): Promise<string | null> => {
 };
 
 export const getCurrentFirebaseUser = (): User | null => {
-  return auth.currentUser;
+  return cachedAuthInstance?.currentUser ?? null;
 };
 
 export const logout = async (): Promise<void> => {
+  const { auth } = await getFirebaseAuth();
   await auth.signOut();
   cachedAccessToken = null;
 };
@@ -112,7 +182,7 @@ async function parseDriveError(res: Response, fallback: string): Promise<string>
     const reason = data.error?.errors?.[0]?.reason;
     const msg = data.error?.message;
     if (reason === 'accessNotConfigured') {
-      return `Google Drive API chưa được bật trên project "${firebaseConfig.projectId}". Vui lòng mở link sau và nhấn Enable (Bật): https://console.cloud.google.com/apis/library/drive.googleapis.com?project=${firebaseConfig.projectId}`;
+      return `Google Drive API chưa được bật trên project "${activeFirebaseConfig.projectId}". Vui lòng mở link sau và nhấn Enable (Bật): https://console.cloud.google.com/apis/library/drive.googleapis.com?project=${activeFirebaseConfig.projectId}`;
     }
     if (reason === 'insufficientPermissions') {
       return 'Tài khoản chưa được cấp đủ quyền Google Drive (drive.file). Vui lòng đăng xuất và đăng nhập lại, nhớ tích chọn quyền Google Drive.';
