@@ -21,14 +21,14 @@ import {
   syncUserProfileOnSignIn,
 } from './lib/firebaseClient';
 import {
+  adminDeleteAssetOnServer,
+  adminRenameAssetOnServer,
+  adminSetVisibilityOnServer,
   createBucketFolder,
-  deleteDriveFile,
   ensureCdnWorkspace,
   getDriveAbout,
   listDriveCdnFiles,
-  makeFilePrivate,
   makeFilePublic,
-  renameDriveFile,
   uploadMediaToDrive,
   uploadToPublicCloudRelay,
 } from './lib/googleDrive';
@@ -170,9 +170,13 @@ export default function App() {
       setLoadingAssets(true);
       setDriveError(null);
       try {
+        const knownRootId =
+          rootFolderRef.current?.id ||
+          relayStatus.rootFolderId ||
+          publicAssets.find((a) => a.folderId)?.folderId;
         const [aboutResult, workspaceResult] = await Promise.allSettled([
           getDriveAbout(driveToken),
-          ensureCdnWorkspace(driveToken),
+          ensureCdnWorkspace(driveToken, knownRootId),
         ]);
 
         let resolvedUser: DriveUser | null = userHint
@@ -324,8 +328,13 @@ export default function App() {
     }
   };
 
-  // Admin Connect Google Drive Host (WITH Drive OAuth scope)
+  // Admin Connect Google Drive Host (only requests Drive OAuth if Bridge 24/7 isn't already running)
   const handleConnectDriveHost = async () => {
+    if (relayStatus.mode === 'bridge' || relayStatus.bridgeConfigured) {
+      await handleSignInRegularUser();
+      return;
+    }
+
     setIsSigningInDrive(true);
     setAuthError(null);
     setDriveError(null);
@@ -605,51 +614,27 @@ export default function App() {
     return created;
   };
 
-  // Admin-only Media Mutations
+  // Admin-only Media Mutations (works directly via Bridge 24/7 or active Relay — no redundant OAuth!)
   const handleTogglePublic = async (asset: CdnAsset, nextPublic: boolean) => {
     const driveToken = getCachedDriveToken();
     const idToken = await getFirebaseIdToken();
-    if (!driveToken || !idToken || userProfile?.role !== 'admin') {
-      throw new Error('Cần kết nối Google Drive Host bằng tài khoản Admin để thay đổi quyền.');
+    if (!idToken || userProfile?.role !== 'admin') {
+      throw new Error('Chỉ tài khoản Admin mới có quyền thay đổi chế độ chia sẻ tệp.');
     }
 
-    if (nextPublic) {
-      await makeFilePublic(driveToken, asset.fileId);
-      const updated = await registerInPublicCatalog(driveToken, { ...asset, isPublic: true });
-      setSelectedAsset(updated);
-    } else {
-      await makeFilePrivate(driveToken, asset.fileId);
-      await fetch(`/api/cdn/catalog/${encodeURIComponent(asset.fileId)}`, {
-        method: 'DELETE',
-        headers: {
-          Authorization: `Bearer ${driveToken}`,
-          'X-Firebase-Id-Token': idToken,
-        },
-      });
-      setSelectedAsset({ ...asset, isPublic: false });
-    }
+    const updated = await adminSetVisibilityOnServer(idToken, asset, nextPublic, driveToken);
+    setSelectedAsset(updated);
     await refreshAll();
   };
 
   const handleRenameAsset = async (asset: CdnAsset, newName: string) => {
     const driveToken = getCachedDriveToken();
     const idToken = await getFirebaseIdToken();
-    if (!driveToken || !idToken || userProfile?.role !== 'admin') {
-      throw new Error('Cần kết nối Google Drive Host bằng tài khoản Admin để đổi tên tệp.');
+    if (!idToken || userProfile?.role !== 'admin') {
+      throw new Error('Chỉ tài khoản Admin mới có quyền đổi tên tệp.');
     }
 
-    await renameDriveFile(driveToken, asset.fileId, newName);
-    if (asset.isPublic) {
-      await fetch(`/api/cdn/catalog/${encodeURIComponent(asset.fileId)}`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${driveToken}`,
-          'X-Firebase-Id-Token': idToken,
-        },
-        body: JSON.stringify({ name: newName }),
-      });
-    }
+    await adminRenameAssetOnServer(idToken, asset.fileId, newName, driveToken);
     setSelectedAsset({ ...asset, name: newName });
     await refreshAll();
   };
@@ -657,23 +642,16 @@ export default function App() {
   const handleDeleteAsset = async (asset: CdnAsset) => {
     const driveToken = getCachedDriveToken();
     const idToken = await getFirebaseIdToken();
-    if (!driveToken || !idToken || userProfile?.role !== 'admin') {
-      throw new Error('Cần kết nối Google Drive Host bằng tài khoản Admin để xóa tệp.');
+    if (!idToken || userProfile?.role !== 'admin') {
+      throw new Error('Chỉ tài khoản Admin mới có quyền xóa tệp.');
     }
 
-    await deleteDriveFile(driveToken, asset.fileId);
-    await fetch(`/api/cdn/catalog/${encodeURIComponent(asset.fileId)}`, {
-      method: 'DELETE',
-      headers: {
-        Authorization: `Bearer ${driveToken}`,
-        'X-Firebase-Id-Token': idToken,
-      },
-    });
+    await adminDeleteAssetOnServer(idToken, asset.fileId, driveToken);
     await refreshAll();
   };
 
   const canManageSelectedAsset =
-    panel === 'admin' && userProfile?.role === 'admin' && isDriveConnected;
+    panel === 'admin' && userProfile?.role === 'admin' && (isDriveConnected || relayStatus.active);
 
   return (
     <>

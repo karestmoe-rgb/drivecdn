@@ -1283,6 +1283,26 @@ export function createApiApp(): Express {
       return;
     }
 
+    // Do not overwrite an active 24/7 Apps Script bridge with a temporary browser OAuth folder
+    if (DRIVE_BRIDGE_URL) {
+      const bridgeRelay = await getActiveRelay();
+      if (bridgeRelay && bridgeRelay.mode === 'bridge') {
+        res.json({
+          enabled: bridgeRelay.enabled,
+          active: true,
+          mode: bridgeRelay.mode,
+          bridgeConfigured: true,
+          rootFolderId: PINNED_DRIVE_FOLDER_ID || bridgeRelay.rootFolderId,
+          ownerName: bridgeRelay.ownerName,
+          ownerEmail: bridgeRelay.ownerEmail,
+          expiresAt: bridgeRelay.expiresAt,
+          buckets: bridgeRelay.buckets,
+          storageQuota: bridgeRelay.storageQuota,
+        });
+        return;
+      }
+    }
+
     const nextRelay: OwnerCloudRelay = {
       enabled: Boolean(enabled),
       mode: 'oauth',
@@ -1515,6 +1535,238 @@ export function createApiApp(): Express {
     await writeCatalog(next);
     cachedDriveCatalog = null;
     res.json({ removed: catalog.length !== next.length });
+  });
+
+  // Admin Drive File Management (works with active Bridge 24/7 OR Admin OAuth token — no redundant login!)
+  async function executeDriveAdminRequest(
+    req: Request,
+    driveUrl: string,
+    init: RequestInit = {}
+  ): Promise<globalThis.Response> {
+    const relay = await getActiveRelay();
+    const headerDriveToken =
+      typeof req.headers['x-drive-token'] === 'string' && req.headers['x-drive-token'].trim()
+        ? req.headers['x-drive-token'].trim()
+        : null;
+    let token = relay?.accessToken || headerDriveToken;
+
+    if (!token) {
+      throw new Error('NO_DRIVE_TOKEN');
+    }
+
+    const buildHeaders = (t: string): Record<string, string> => ({
+      ...(init.headers as Record<string, string> | undefined),
+      Authorization: `Bearer ${t}`,
+    });
+
+    let res = await fetch(driveUrl, { ...init, headers: buildHeaders(token) });
+    if (res.status === 401 && DRIVE_BRIDGE_URL) {
+      const refreshed = await getActiveRelay(true);
+      if (refreshed?.accessToken) {
+        token = refreshed.accessToken;
+        res = await fetch(driveUrl, { ...init, headers: buildHeaders(token) });
+      }
+    }
+    return res;
+  }
+
+  app.delete('/api/admin/files/:fileId', async (req: Request, res: Response) => {
+    const access = await verifyUserAccess(req);
+    if (!access) {
+      res.status(401).json({ error: 'Vui lòng đăng nhập tài khoản Google Admin.' });
+      return;
+    }
+    if (!access.isAdmin) {
+      res.status(403).json({ error: 'Chỉ Admin mới có quyền xóa tệp.' });
+      return;
+    }
+
+    const fileId = String(req.params.fileId || '').trim();
+    if (!fileId || !/^[A-Za-z0-9_-]{10,}$/.test(fileId)) {
+      res.status(400).json({ error: 'Mã fileId Google Drive không hợp lệ.' });
+      return;
+    }
+
+    try {
+      const driveRes = await executeDriveAdminRequest(
+        req,
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
+        { method: 'DELETE' }
+      );
+
+      if (!driveRes.ok && driveRes.status !== 404) {
+        const msg = await driveRes.text().catch(() => '');
+        res.status(502).json({
+          error: `Google Drive không cho phép xóa tệp (HTTP ${driveRes.status})${msg ? `: ${msg}` : ''}`,
+        });
+        return;
+      }
+
+      const catalog = await readCatalog();
+      const next = catalog.filter((item) => item.fileId !== fileId);
+      await writeCatalog(next);
+      cachedDriveCatalog = null;
+      res.json({ deleted: true, removedFromCatalog: catalog.length !== next.length });
+    } catch (err) {
+      if (err instanceof Error && err.message === 'NO_DRIVE_TOKEN') {
+        res.status(503).json({
+          error: 'Chưa có kết nối Google Drive Host (Bridge 24/7 hoặc OAuth) để xóa tệp.',
+        });
+        return;
+      }
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Lỗi máy chủ khi xóa tệp.',
+      });
+    }
+  });
+
+  app.patch('/api/admin/files/:fileId', async (req: Request, res: Response) => {
+    const access = await verifyUserAccess(req);
+    if (!access) {
+      res.status(401).json({ error: 'Vui lòng đăng nhập tài khoản Google Admin.' });
+      return;
+    }
+    if (!access.isAdmin) {
+      res.status(403).json({ error: 'Chỉ Admin mới có quyền đổi tên tệp.' });
+      return;
+    }
+
+    const fileId = String(req.params.fileId || '').trim();
+    const { name, bucket } = req.body as { name?: string; bucket?: string };
+    if (!name?.trim() && !bucket?.trim()) {
+      res.status(400).json({ error: 'Thiếu tên tệp mới cần cập nhật.' });
+      return;
+    }
+
+    try {
+      if (name?.trim()) {
+        const driveRes = await executeDriveAdminRequest(
+          req,
+          `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}`,
+          {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: name.trim() }),
+          }
+        );
+        if (!driveRes.ok) {
+          const msg = await driveRes.text().catch(() => '');
+          res.status(502).json({
+            error: `Không thể đổi tên tệp trên Google Drive (HTTP ${driveRes.status})${msg ? `: ${msg}` : ''}`,
+          });
+          return;
+        }
+      }
+
+      const catalog = await readCatalog();
+      const idx = catalog.findIndex((item) => item.fileId === fileId);
+      if (idx >= 0) {
+        if (name?.trim()) catalog[idx].name = name.trim();
+        if (bucket?.trim()) catalog[idx].bucket = bucket.trim();
+        await writeCatalog(catalog);
+      }
+      cachedDriveCatalog = null;
+      res.json({ ok: true, item: idx >= 0 ? catalog[idx] : null });
+    } catch (err) {
+      if (err instanceof Error && err.message === 'NO_DRIVE_TOKEN') {
+        res.status(503).json({
+          error: 'Chưa có kết nối Google Drive Host để đổi tên tệp.',
+        });
+        return;
+      }
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Lỗi máy chủ khi đổi tên tệp.',
+      });
+    }
+  });
+
+  app.post('/api/admin/files/:fileId/visibility', async (req: Request, res: Response) => {
+    const access = await verifyUserAccess(req);
+    if (!access) {
+      res.status(401).json({ error: 'Vui lòng đăng nhập tài khoản Google Admin.' });
+      return;
+    }
+    if (!access.isAdmin) {
+      res.status(403).json({ error: 'Chỉ Admin mới có quyền thay đổi chế độ chia sẻ tệp.' });
+      return;
+    }
+
+    const fileId = String(req.params.fileId || '').trim();
+    const { isPublic, asset } = req.body as {
+      isPublic?: boolean;
+      asset?: Partial<CatalogEntry>;
+    };
+
+    try {
+      if (isPublic) {
+        const permRes = await executeDriveAdminRequest(
+          req,
+          `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/permissions`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ role: 'reader', type: 'anyone' }),
+          }
+        );
+        if (!permRes.ok) {
+          res.status(502).json({ error: 'Không thể bật quyền chia sẻ công khai trên Google Drive.' });
+          return;
+        }
+
+        const relay = await getActiveRelay();
+        const entry = await publishAndIndexDriveFile(
+          relay?.accessToken || String(req.headers['x-drive-token'] || ''),
+          fileId,
+          asset?.bucket || 'Images',
+          asset?.folderId || relay?.rootFolderId || '',
+          asset?.uploadedBy || access.displayName || access.email,
+          relay?.ownerName || access.displayName || 'Admin',
+          relay?.ownerEmail || access.email,
+          asset?.name,
+          asset?.mimeType,
+          asset?.size
+        );
+        cachedDriveCatalog = null;
+        res.json({ item: entry });
+        return;
+      }
+
+      const listRes = await executeDriveAdminRequest(
+        req,
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/permissions?fields=permissions(id,type,role)`
+      );
+      if (!listRes.ok) {
+        res.status(502).json({ error: 'Không thể đọc danh sách quyền chia sẻ của tệp.' });
+        return;
+      }
+      const permData = (await listRes.json()) as {
+        permissions?: { id: string; type: string; role: string }[];
+      };
+      const publicPerms = (permData.permissions ?? []).filter((p) => p.type === 'anyone');
+      for (const p of publicPerms) {
+        await executeDriveAdminRequest(
+          req,
+          `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/permissions/${encodeURIComponent(p.id)}`,
+          { method: 'DELETE' }
+        );
+      }
+
+      const catalog = await readCatalog();
+      const next = catalog.filter((item) => item.fileId !== fileId);
+      await writeCatalog(next);
+      cachedDriveCatalog = null;
+      res.json({ isPublic: false });
+    } catch (err) {
+      if (err instanceof Error && err.message === 'NO_DRIVE_TOKEN') {
+        res.status(503).json({
+          error: 'Chưa có kết nối Google Drive Host để thay đổi quyền tệp.',
+        });
+        return;
+      }
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Lỗi máy chủ khi cập nhật quyền tệp.',
+      });
+    }
   });
 
   app.get('/api/cdn/raw/:fileId', async (req: Request, res: Response) => {

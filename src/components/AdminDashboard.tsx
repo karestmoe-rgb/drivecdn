@@ -287,24 +287,34 @@ export function AdminDashboard({
             )}
 
             <div className="mt-6 flex flex-col gap-3">
-              <GoogleSignInButton
-                onClick={() => void onConnectDriveHost()}
-                disabled={isSigningInDrive || isSigningIn}
-                label={
-                  isSigningInDrive
-                    ? 'Đang kết nối Google Drive Host...'
-                    : 'Đăng nhập & Kết nối Google Drive Host'
-                }
-              />
+              {relayStatus.bridgeConfigured || relayStatus.active ? (
+                <GoogleSignInButton
+                  onClick={() => void onSignInAdminGoogle()}
+                  disabled={isSigningIn || isSigningInDrive}
+                  label={isSigningIn ? 'Đang đăng nhập...' : 'Đăng nhập Admin với Google'}
+                />
+              ) : (
+                <>
+                  <GoogleSignInButton
+                    onClick={() => void onConnectDriveHost()}
+                    disabled={isSigningInDrive || isSigningIn}
+                    label={
+                      isSigningInDrive
+                        ? 'Đang kết nối Google Drive Host...'
+                        : 'Đăng nhập & Kết nối Google Drive Host'
+                    }
+                  />
 
-              <button
-                type="button"
-                onClick={() => void onSignInAdminGoogle()}
-                disabled={isSigningIn || isSigningInDrive}
-                className="min-h-[44px] rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-2.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-100 disabled:opacity-50"
-              >
-                {isSigningIn ? 'Đang đăng nhập...' : 'Chỉ đăng nhập Admin (Dùng Bridge 24/7)'}
-              </button>
+                  <button
+                    type="button"
+                    onClick={() => void onSignInAdminGoogle()}
+                    disabled={isSigningIn || isSigningInDrive}
+                    className="min-h-[44px] rounded-lg border border-zinc-200 bg-zinc-50 px-4 py-2.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-100 disabled:opacity-50"
+                  >
+                    {isSigningIn ? 'Đang đăng nhập...' : 'Chỉ đăng nhập Admin (Không cấp OAuth Drive)'}
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </main>
@@ -571,17 +581,30 @@ export function AdminDashboard({
                 Google Drive Host
               </div>
 
-              {isDriveConnected ? (
-                <div className="mt-2 text-xs text-emerald-700">
-                  Đã kết nối OAuth ({driveUser?.emailAddress || userProfile.email})
+              {relayStatus.active && relayStatus.mode === 'bridge' ? (
+                <div className="mt-2 space-y-1 text-xs">
+                  <div className="font-medium text-emerald-700">
+                    Bridge 24/7 đang hoạt động
+                  </div>
+                  {relayStatus.ownerEmail && (
+                    <div className="truncate text-zinc-500">{relayStatus.ownerEmail}</div>
+                  )}
+                  <div className="text-[11px] text-zinc-500">
+                    Toàn quyền tải lên &amp; xóa tệp mà không cần OAuth lại.
+                  </div>
+                </div>
+              ) : isDriveConnected || relayStatus.active ? (
+                <div className="mt-2 space-y-1 text-xs">
+                  <div className="font-medium text-emerald-700">
+                    Đã kết nối ({driveUser?.emailAddress || relayStatus.ownerEmail || userProfile.email})
+                  </div>
+                  <div className="text-[11px] text-zinc-500">
+                    Đã bật quyền tải lên &amp; xóa tệp.
+                  </div>
                 </div>
               ) : (
                 <div className="mt-2 space-y-2">
-                  <div className="text-xs text-amber-700">
-                    {relayStatus.active && relayStatus.mode === 'bridge'
-                      ? 'Đang dùng Bridge 24/7 (cần OAuth nếu muốn xóa tệp)'
-                      : 'Chưa kết nối Drive OAuth'}
-                  </div>
+                  <div className="text-xs text-amber-700">Chưa kết nối Drive Host</div>
                   <button
                     type="button"
                     onClick={() => void onConnectDriveHost()}
@@ -1091,13 +1114,13 @@ export function AdminDashboard({
                   </button>
                 </div>
 
-                {!isDriveConnected && (
+                {!isDriveConnected && !relayStatus.active && (
                   <button
                     type="button"
-                    onClick={() => void onConnectDriveHost()}
+                    onClick={() => setActiveTab('drive')}
                     className="min-h-[36px] rounded-lg border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-900 hover:bg-amber-100"
                   >
-                    Kết nối Google Drive OAuth để mở quyền Xóa / Đổi tên tệp
+                    Kết nối Google Drive Host để bật Xóa / Tải lên
                   </button>
                 )}
               </div>
@@ -1106,7 +1129,7 @@ export function AdminDashboard({
                 <LibraryView
                   assets={assets}
                   loading={loadingAssets}
-                  canManage={isDriveConnected}
+                  canManage={isDriveConnected || relayStatus.active}
                   canUpload={true}
                   authToken={firebaseIdToken}
                   activeBucket={activeBucket}

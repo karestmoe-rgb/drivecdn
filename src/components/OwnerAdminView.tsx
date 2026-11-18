@@ -157,28 +157,51 @@ export function OwnerAdminView({
       )}
 
       {!isAuthenticated ? (
-        <div className="space-y-6">
-          <div className="rounded-xl border border-zinc-200 bg-white p-6">
-            <div className="max-w-xl">
-              <div className="flex h-11 w-11 items-center justify-center rounded-xl border border-zinc-200 bg-zinc-50 text-zinc-700">
-                <ShieldCheck className="h-5 w-5" />
+        relayStatus.active && relayStatus.mode === 'bridge' ? (
+          <div className="rounded-xl border border-zinc-200 bg-white p-6 space-y-4">
+            <h2 className="text-base font-semibold text-zinc-900">
+              Không cần đăng nhập Google Drive OAuth bổ sung
+            </h2>
+            <p className="text-sm leading-relaxed text-zinc-600">
+              Hệ thống đang kết nối trực tiếp thông qua cầu nối <code className="rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-xs">DRIVE_BRIDGE_URL</code>. Admin đã có đầy đủ quyền tải lên, đổi tên, bật/tắt công khai và xóa tệp trong kho Media mà không tạo thêm thư mục trùng lặp.
+            </p>
+            {relayStatus.buckets.length > 0 && (
+              <div className="divide-y divide-zinc-100 rounded-lg border border-zinc-200">
+                {relayStatus.buckets.map((b) => (
+                  <div key={b.id} className="flex items-center justify-between px-3.5 py-2.5 text-xs">
+                    <span className="font-medium text-zinc-900">{b.name}</span>
+                    <span className="font-mono text-[11px] text-zinc-500 truncate max-w-[220px]">
+                      {b.id}
+                    </span>
+                  </div>
+                ))}
               </div>
-              <h2 className="mt-4 text-base font-semibold text-zinc-900">
-                Cách 1 · Mở cổng nhanh qua trình duyệt (hiệu lực ~58 phút)
-              </h2>
-              <p className="mt-2 text-sm leading-relaxed text-zinc-600">
-                Đăng nhập Google Drive tại đây để mở cổng tải lên ngay lập tức và quản lý (đổi tên, xóa, ẩn) tệp. Lưu ý: Token đăng nhập Google trên trình duyệt sẽ hết hạn sau ~1 giờ; để chạy 24/7 trên Vercel không bao giờ phải đăng nhập lại, hãy thiết lập Cách 2 bên dưới.
-              </p>
-              <div className="mt-5">
-                <GoogleSignInButton
-                  onClick={onSignIn}
-                  disabled={isSigningIn}
-                  label={isSigningIn ? 'Đang kết nối...' : 'Sign in with Google'}
-                />
+            )}
+          </div>
+        ) : (
+          <div className="space-y-6">
+            <div className="rounded-xl border border-zinc-200 bg-white p-6">
+              <div className="max-w-xl">
+                <div className="flex h-11 w-11 items-center justify-center rounded-xl border border-zinc-200 bg-zinc-50 text-zinc-700">
+                  <ShieldCheck className="h-5 w-5" />
+                </div>
+                <h2 className="mt-4 text-base font-semibold text-zinc-900">
+                  Cách 1 · Mở cổng nhanh qua trình duyệt (hiệu lực ~58 phút)
+                </h2>
+                <p className="mt-2 text-sm leading-relaxed text-zinc-600">
+                  Đăng nhập Google Drive tại đây để mở cổng tải lên ngay lập tức và quản lý (đổi tên, xóa, ẩn) tệp. Lưu ý: Token đăng nhập Google trên trình duyệt sẽ hết hạn sau ~1 giờ; để chạy 24/7 trên Vercel không bao giờ phải đăng nhập lại, hãy thiết lập Cách 2 bên dưới.
+                </p>
+                <div className="mt-5">
+                  <GoogleSignInButton
+                    onClick={onSignIn}
+                    disabled={isSigningIn}
+                    label={isSigningIn ? 'Đang kết nối...' : 'Sign in with Google'}
+                  />
+                </div>
               </div>
             </div>
           </div>
-        </div>
+        )
       ) : (
         <div className="grid gap-6 lg:grid-cols-12">
           {/* Account & Public Upload Gate */}

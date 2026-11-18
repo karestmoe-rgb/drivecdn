@@ -112,15 +112,37 @@ async function createFolder(token: string, name: string, parentId?: string): Pro
   return (await res.json()) as DriveFolder;
 }
 
-export async function ensureCdnWorkspace(token: string): Promise<{
+async function getFolderById(token: string, folderId: string): Promise<DriveFolder | null> {
+  try {
+    const res = await fetch(
+      `${DRIVE_API}/files/${encodeURIComponent(folderId)}?fields=id,name,createdTime,trashed`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as DriveFolder & { trashed?: boolean };
+    if (!data.id || data.trashed) return null;
+    return { id: data.id, name: data.name, createdTime: data.createdTime };
+  } catch {
+    return null;
+  }
+}
+
+export async function ensureCdnWorkspace(
+  token: string,
+  knownRootFolderId?: string
+): Promise<{
   rootFolder: DriveFolder;
   buckets: DriveFolder[];
 }> {
-  const existingLock = workspaceLocks.get(token);
+  const lockKey = `${token}:${knownRootFolderId || ''}`;
+  const existingLock = workspaceLocks.get(lockKey);
   if (existingLock) return existingLock;
 
   const task = (async () => {
-    let rootFolder = await findFolderByName(token, CDN_ROOT_FOLDER_NAME);
+    let rootFolder = knownRootFolderId ? await getFolderById(token, knownRootFolderId) : null;
+    if (!rootFolder) {
+      rootFolder = await findFolderByName(token, CDN_ROOT_FOLDER_NAME);
+    }
     if (!rootFolder) {
       rootFolder = await createFolder(token, CDN_ROOT_FOLDER_NAME);
     }
@@ -138,11 +160,11 @@ export async function ensureCdnWorkspace(token: string): Promise<{
     };
   })();
 
-  workspaceLocks.set(token, task);
+  workspaceLocks.set(lockKey, task);
   try {
     return await task;
   } catch (err) {
-    workspaceLocks.delete(token);
+    workspaceLocks.delete(lockKey);
     throw err;
   }
 }
@@ -530,4 +552,72 @@ export async function deleteDriveFile(token: string, fileId: string): Promise<vo
   if (!res.ok) {
     throw new Error(await parseDriveError(res, 'Không thể xóa tệp khỏi Google Drive'));
   }
+}
+
+export async function adminDeleteAssetOnServer(
+  idToken: string,
+  fileId: string,
+  driveToken?: string | null
+): Promise<void> {
+  const headers: Record<string, string> = {
+    'X-Firebase-Id-Token': idToken,
+  };
+  if (driveToken) headers['X-Drive-Token'] = driveToken;
+
+  const res = await fetch(`/api/admin/files/${encodeURIComponent(fileId)}`, {
+    method: 'DELETE',
+    headers,
+  });
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(data.error || `Không thể xóa tệp (HTTP ${res.status}).`);
+  }
+}
+
+export async function adminRenameAssetOnServer(
+  idToken: string,
+  fileId: string,
+  newName: string,
+  driveToken?: string | null
+): Promise<void> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Firebase-Id-Token': idToken,
+  };
+  if (driveToken) headers['X-Drive-Token'] = driveToken;
+
+  const res = await fetch(`/api/admin/files/${encodeURIComponent(fileId)}`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify({ name: newName.trim() }),
+  });
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(data.error || `Không thể đổi tên tệp (HTTP ${res.status}).`);
+  }
+}
+
+export async function adminSetVisibilityOnServer(
+  idToken: string,
+  asset: CdnAsset,
+  isPublic: boolean,
+  driveToken?: string | null
+): Promise<CdnAsset> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Firebase-Id-Token': idToken,
+  };
+  if (driveToken) headers['X-Drive-Token'] = driveToken;
+
+  const res = await fetch(`/api/admin/files/${encodeURIComponent(asset.fileId)}/visibility`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ isPublic, asset }),
+  });
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(data.error || `Không thể cập nhật quyền tệp (HTTP ${res.status}).`);
+  }
+  const data = (await res.json().catch(() => ({}))) as { item?: CdnAsset };
+  return data.item || { ...asset, isPublic };
 }
