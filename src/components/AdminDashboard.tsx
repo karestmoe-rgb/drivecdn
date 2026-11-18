@@ -29,6 +29,8 @@ import {
   adminDeleteUserRecord,
   adminUpdateUserPermissions,
   formatFirestoreUiError,
+  getActiveProjectId,
+  isAdminEmailConfigured,
   subscribeAllUsers,
 } from '../lib/firebaseClient';
 import { formatBytes } from '../lib/format';
@@ -427,6 +429,14 @@ export function AdminDashboard({
             <p className="mt-2 text-sm leading-relaxed text-zinc-600">
               Tài khoản <span className="font-medium text-zinc-900">{userProfile.email}</span> là tài khoản User thông thường, không phải Admin host Google Drive.
             </p>
+            {!isAdminEmailConfigured() && (
+              <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-xs leading-relaxed text-amber-950">
+                <div className="font-semibold">Lưu ý cho người tự host (Clone &amp; Deploy):</div>
+                <p className="mt-1">
+                  Project Firebase <code className="rounded bg-white/80 px-1 py-0.5 font-mono">{getActiveProjectId()}</code> hiện chưa thiết lập biến môi trường <code className="rounded bg-white/80 px-1 py-0.5 font-mono">ADMIN_EMAIL</code>. Hãy đặt <code className="rounded bg-white/80 px-1 py-0.5 font-mono">ADMIN_EMAIL={userProfile.email}</code> trong <code className="rounded bg-white/80 px-1 py-0.5 font-mono">.env</code> / Vercel Environment Variables và cập nhật email đó trong <code className="rounded bg-white/80 px-1 py-0.5 font-mono">firestore.rules</code> (xem <code className="rounded bg-white/80 px-1 py-0.5 font-mono">README.md</code>).
+                </p>
+              </div>
+            )}
             <div className="mt-6 flex flex-wrap items-center gap-3">
               <button
                 type="button"

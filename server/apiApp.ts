@@ -57,7 +57,18 @@ const HAS_KV = Boolean(KV_URL && KV_TOKEN);
 const DRIVE_BRIDGE_URL = (process.env.DRIVE_BRIDGE_URL || '').trim();
 const DRIVE_BRIDGE_SECRET = (process.env.DRIVE_BRIDGE_SECRET || '').trim();
 const PINNED_DRIVE_FOLDER_ID = (process.env.DRIVE_FOLDER_ID || '').trim();
-const BOOTSTRAPPED_ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'karestmoe@gmail.com').trim().toLowerCase();
+const AI_STUDIO_WORKSPACE_PROJECT_ID = 'gen-lang-client-0616030898';
+const AI_STUDIO_WORKSPACE_ADMIN_EMAIL = 'karestmoe@gmail.com';
+
+function resolveAdminEmail(projectId?: string, configAdminEmail?: string): string {
+  const envAdmin = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+  if (envAdmin) return envAdmin;
+  if (configAdminEmail?.trim()) return configAdminEmail.trim().toLowerCase();
+  if (projectId === AI_STUDIO_WORKSPACE_PROJECT_ID) {
+    return AI_STUDIO_WORKSPACE_ADMIN_EMAIL;
+  }
+  return '';
+}
 
 const DATA_DIR = IS_VERCEL ? '/tmp/drivecdn-data' : path.resolve(process.cwd(), 'data');
 const CATALOG_PATH = path.join(DATA_DIR, 'cdn-catalog.json');
@@ -663,7 +674,7 @@ function resolveFirebaseServerConfig(): FirebaseServerConfig | null {
       storageBucket: process.env.FIREBASE_STORAGE_BUCKET || '',
       messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '',
       firestoreDatabaseId: normalizeFirestoreDatabaseId(process.env.FIREBASE_FIRESTORE_DATABASE_ID),
-      adminEmail: BOOTSTRAPPED_ADMIN_EMAIL,
+      adminEmail: resolveAdminEmail(projectId),
     };
   }
 
@@ -680,7 +691,7 @@ function resolveFirebaseServerConfig(): FirebaseServerConfig | null {
           storageBucket: parsed.storageBucket || '',
           messagingSenderId: parsed.messagingSenderId || '',
           firestoreDatabaseId: normalizeFirestoreDatabaseId(parsed.firestoreDatabaseId),
-          adminEmail: BOOTSTRAPPED_ADMIN_EMAIL,
+          adminEmail: resolveAdminEmail(parsed.projectId, parsed.adminEmail),
         };
       }
     }
@@ -773,7 +784,7 @@ async function verifyUserAccess(req: Request): Promise<VerifiedUserAccess | null
     return null;
   }
 
-  if (identity.email.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL) {
+  if (cfg.adminEmail && identity.email.toLowerCase() === cfg.adminEmail) {
     return {
       uid: identity.uid,
       email: identity.email,

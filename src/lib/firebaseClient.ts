@@ -26,7 +26,8 @@ import defaultFirebaseConfig from '../../firebase-applet-config.json';
 import type { UserAccount, UserStatus } from '../types/cdn';
 
 export const DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.file'];
-const DEFAULT_ADMIN_EMAIL = 'karestmoe@gmail.com';
+const AI_STUDIO_WORKSPACE_PROJECT_ID = 'gen-lang-client-0616030898';
+const AI_STUDIO_WORKSPACE_ADMIN_EMAIL = 'karestmoe@gmail.com';
 
 export interface FirebaseClientConfig {
   apiKey: string;
@@ -179,7 +180,7 @@ export async function getFirebaseServices(): Promise<{
               storageBucket: data.storageBucket || '',
               messagingSenderId: data.messagingSenderId || '',
               firestoreDatabaseId: data.firestoreDatabaseId || '',
-              adminEmail: data.adminEmail || DEFAULT_ADMIN_EMAIL,
+              adminEmail: data.adminEmail || '',
             };
           }
         }
@@ -324,13 +325,23 @@ export async function signOutAccount(): Promise<void> {
 // ---------------- Firestore RBAC Sync & Admin Controls ----------------
 
 function getConfiguredAdminEmail(config: FirebaseClientConfig): string {
-  return (config.adminEmail || DEFAULT_ADMIN_EMAIL).trim().toLowerCase();
+  if (config.adminEmail?.trim()) {
+    return config.adminEmail.trim().toLowerCase();
+  }
+  if (config.projectId === AI_STUDIO_WORKSPACE_PROJECT_ID) {
+    return AI_STUDIO_WORKSPACE_ADMIN_EMAIL;
+  }
+  return '';
+}
+
+export function isAdminEmailConfigured(): boolean {
+  return Boolean(getConfiguredAdminEmail(activeFirebaseConfig));
 }
 
 export async function checkIsAdminUser(user: User): Promise<boolean> {
   const { db, config } = await getFirebaseServices();
   const adminEmail = getConfiguredAdminEmail(config);
-  if (user.emailVerified && user.email?.toLowerCase() === adminEmail) {
+  if (adminEmail && user.emailVerified && user.email?.toLowerCase() === adminEmail) {
     return true;
   }
   try {
@@ -359,7 +370,7 @@ export async function syncUserProfileOnSignIn(user: User): Promise<UserAccount> 
     const safeEmail = (user.email || '').slice(0, 254);
     const safePhoto = user.photoURL ? user.photoURL.slice(0, 500) : undefined;
 
-    if (isAdmin && user.emailVerified && user.email?.toLowerCase() === adminEmail) {
+    if (isAdmin && adminEmail && user.emailVerified && user.email?.toLowerCase() === adminEmail) {
       const adminRef = doc(db, 'admins', user.uid);
       try {
         const adminSnap = await withTimeout(
