@@ -32,7 +32,6 @@ import { UploaderView } from './components/UploaderView';
 import { ApiDocsView } from './components/ApiDocsView';
 import { OwnerAdminView } from './components/OwnerAdminView';
 import { AssetInspectorModal } from './components/AssetInspectorModal';
-import { GoogleSignInButton } from './components/GoogleSignInButton';
 
 const INITIAL_RELAY_STATUS: PublicRelayStatus = {
   enabled: false,
@@ -289,9 +288,13 @@ export default function App() {
   }, [publicAssets, driveAssets]);
 
   const bucketNames = useMemo(() => {
-    const set = new Set<string>();
-    for (const b of driveBuckets) set.add(b.name);
-    for (const b of relayStatus.buckets) set.add(b.name);
+    const set = new Set<string>(['Images', 'Videos']);
+    for (const b of driveBuckets) {
+      if (b.name !== 'DriveCDN') set.add(b.name);
+    }
+    for (const b of relayStatus.buckets) {
+      if (b.name !== 'DriveCDN') set.add(b.name);
+    }
     for (const item of mergedAssets) set.add(item.bucket);
     return Array.from(set).sort();
   }, [driveBuckets, relayStatus.buckets, mergedAssets]);
@@ -354,26 +357,28 @@ export default function App() {
       try {
         updateTask({ status: 'uploading', progress: 0 });
 
-        if (token && isOwnerSignedIn) {
-          let activeBuckets = driveBuckets;
-          if (activeBuckets.length === 0) {
+        const useBridgeRelay = relayStatus.active && relayStatus.mode === 'bridge';
+
+        if (token && isOwnerSignedIn && !useBridgeRelay) {
+          let activeRoot = rootFolder || rootFolderRef.current;
+          if (!activeRoot) {
             const ws = await ensureCdnWorkspace(token);
             rootFolderRef.current = ws.rootFolder;
             setRootFolder(ws.rootFolder);
             setDriveBuckets(ws.buckets);
-            activeBuckets = ws.buckets;
+            activeRoot = ws.rootFolder;
           }
 
-          const targetFolder =
-            (bucketId && activeBuckets.find((b) => b.id === bucketId)) ||
-            activeBuckets.find((b) => b.name === task.bucket) ||
-            activeBuckets[0];
+          const targetFolderId =
+            (bucketId &&
+              driveBuckets.find((b) => b.id === bucketId && b.name !== 'DriveCDN')?.id) ||
+            activeRoot?.id;
 
-          if (!targetFolder) {
+          if (!targetFolderId) {
             throw new Error('Không tìm thấy thư mục lưu trữ trên Google Drive.');
           }
 
-          const uploaded = await uploadMediaToDrive(token, file, targetFolder.id, (progress, speedBps) => {
+          const uploaded = await uploadMediaToDrive(token, file, targetFolderId, (progress, speedBps) => {
             updateTask({ progress, speedBps });
           });
 
@@ -386,8 +391,8 @@ export default function App() {
             mimeType: uploaded.mimeType || file.type,
             size: Number(uploaded.size || file.size),
             kind: task.kind,
-            bucket: targetFolder.name,
-            folderId: targetFolder.id,
+            bucket: task.bucket,
+            folderId: targetFolderId,
             width: uploaded.imageMediaMetadata?.width ?? uploaded.videoMediaMetadata?.width,
             height: uploaded.imageMediaMetadata?.height ?? uploaded.videoMediaMetadata?.height,
             durationMillis: uploaded.videoMediaMetadata?.durationMillis
@@ -674,17 +679,18 @@ export default function App() {
                   {relayStatus.active ? 'Đang mở' : 'Tạm đóng'}
                 </span>
               </div>
-              {!isOwnerSignedIn && (
-                <div className="mt-3">
-                  <GoogleSignInButton
-                    onClick={() => void handleOwnerLogin()}
-                    disabled={isSigningIn}
-                    label={isSigningIn ? 'Đang kết nối...' : 'Sign in with Google'}
-                  />
-                  <p className="mt-1.5 text-[11px] text-zinc-500">
-                    Chỉ dành cho chủ sở hữu cấp quyền Drive. Khách không cần đăng nhập.
-                  </p>
-                </div>
+              {relayStatus.active ? (
+                <p className="mt-1.5 text-[11px] text-zinc-500">
+                  Khách truy cập tải ảnh &amp; video tự do, không cần đăng nhập.
+                </p>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('admin')}
+                  className="mt-2.5 w-full rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-left text-[11px] font-medium text-zinc-700 hover:bg-zinc-100"
+                >
+                  Chủ sở hữu: Kết nối Drive tại Quản trị →
+                </button>
               )}
             </div>
           </div>

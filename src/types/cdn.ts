@@ -43,6 +43,10 @@ export interface DriveFolder {
 export interface PublicRelayStatus {
   enabled: boolean;
   active: boolean;
+  mode?: 'oauth' | 'bridge';
+  bridgeConfigured?: boolean;
+  bridgeError?: string;
+  rootFolderId?: string;
   ownerName?: string;
   ownerEmail?: string;
   expiresAt?: number;

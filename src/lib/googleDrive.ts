@@ -168,7 +168,6 @@ export const logout = async (): Promise<void> => {
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const DRIVE_UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3';
 const CDN_ROOT_FOLDER_NAME = 'DriveCDN';
-const DEFAULT_BUCKETS = ['Images', 'Videos'];
 
 async function parseDriveError(res: Response, fallback: string): Promise<string> {
   try {
@@ -229,12 +228,17 @@ export async function getDriveAbout(token: string): Promise<{
   };
 }
 
+const workspaceLocks = new Map<
+  string,
+  Promise<{ rootFolder: DriveFolder; buckets: DriveFolder[] }>
+>();
+
 async function findFolderByName(token: string, name: string, parentId?: string): Promise<DriveFolder | null> {
   const escapedName = name.replace(/'/g, "\\'");
-  const parentClause = parentId ? ` and '${parentId}' in parents` : ` and 'root' in parents`;
+  const parentClause = parentId ? ` and '${parentId}' in parents` : '';
   const q = `mimeType = 'application/vnd.google-apps.folder' and name = '${escapedName}' and trashed = false${parentClause}`;
   const res = await fetch(
-    `${DRIVE_API}/files?q=${encodeURIComponent(q)}&fields=files(id,name,createdTime)&pageSize=10`,
+    `${DRIVE_API}/files?q=${encodeURIComponent(q)}&fields=files(id,name,createdTime)&orderBy=createdTime asc&pageSize=10`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
   if (!res.ok) {
@@ -270,36 +274,37 @@ export async function ensureCdnWorkspace(token: string): Promise<{
   rootFolder: DriveFolder;
   buckets: DriveFolder[];
 }> {
-  let rootFolder = await findFolderByName(token, CDN_ROOT_FOLDER_NAME);
-  if (!rootFolder) {
-    rootFolder = await createFolder(token, CDN_ROOT_FOLDER_NAME);
-  }
+  const existingLock = workspaceLocks.get(token);
+  if (existingLock) return existingLock;
 
-  const q = `mimeType = 'application/vnd.google-apps.folder' and '${rootFolder.id}' in parents and trashed = false`;
-  const listRes = await fetch(
-    `${DRIVE_API}/files?q=${encodeURIComponent(q)}&fields=files(id,name,createdTime)&orderBy=name`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
-  if (!listRes.ok) {
-    throw new Error(await parseDriveError(listRes, 'Không thể đọc danh sách thư mục DriveCDN'));
-  }
-  const existingData = (await listRes.json()) as { files?: DriveFolder[] };
-  const existingMap = new Map<string, DriveFolder>();
-  for (const folder of existingData.files ?? []) {
-    existingMap.set(folder.name, folder);
-  }
-
-  for (const defaultName of DEFAULT_BUCKETS) {
-    if (!existingMap.has(defaultName)) {
-      const created = await createFolder(token, defaultName, rootFolder.id);
-      existingMap.set(created.name, created);
+  const task = (async () => {
+    let rootFolder = await findFolderByName(token, CDN_ROOT_FOLDER_NAME);
+    if (!rootFolder) {
+      rootFolder = await createFolder(token, CDN_ROOT_FOLDER_NAME);
     }
-  }
 
-  return {
-    rootFolder,
-    buckets: Array.from(existingMap.values()),
-  };
+    // Read any existing subfolders (for backwards compatibility with previously uploaded files)
+    // without creating any new folders. All new uploads go directly into the single rootFolder.
+    const q = `mimeType = 'application/vnd.google-apps.folder' and '${rootFolder.id}' in parents and trashed = false`;
+    const listRes = await fetch(
+      `${DRIVE_API}/files?q=${encodeURIComponent(q)}&fields=files(id,name,createdTime)&orderBy=name`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    const existingData = listRes.ok ? ((await listRes.json()) as { files?: DriveFolder[] }) : { files: [] };
+
+    return {
+      rootFolder,
+      buckets: [rootFolder, ...(existingData.files ?? [])],
+    };
+  })();
+
+  workspaceLocks.set(token, task);
+  try {
+    return await task;
+  } catch (err) {
+    workspaceLocks.delete(token);
+    throw err;
+  }
 }
 
 export async function createBucketFolder(
@@ -335,8 +340,9 @@ export async function listDriveCdnFiles(
   owner?: DriveUser | null
 ): Promise<CdnAsset[]> {
   if (buckets.length === 0) return [];
+  const uniqueFolders = Array.from(new Map(buckets.map((b) => [b.id, b])).values());
   const bucketMap = new Map<string, string>();
-  const parentQueries = buckets.map((b) => {
+  const parentQueries = uniqueFolders.map((b) => {
     bucketMap.set(b.id, b.name);
     return `'${b.id}' in parents`;
   });
@@ -358,7 +364,13 @@ export async function listDriveCdnFiles(
   return (data.files ?? []).map((f): CdnAsset => {
     const kind: MediaKind = f.mimeType.startsWith('video/') ? 'video' : 'image';
     const parentId = f.parents?.[0];
-    const bucket = (parentId && bucketMap.get(parentId)) || (kind === 'video' ? 'Videos' : 'Images');
+    const folderName = parentId ? bucketMap.get(parentId) : undefined;
+    const bucket =
+      folderName && folderName !== CDN_ROOT_FOLDER_NAME
+        ? folderName
+        : kind === 'video'
+        ? 'Videos'
+        : 'Images';
     const isAnyonePublic = Boolean(
       f.permissions?.some((p) => p.type === 'anyone') || f.shared
     );
@@ -550,46 +562,51 @@ export async function uploadToPublicCloudRelay(
     onProgress?.(100, 0);
     return completeData.item;
   } catch (err) {
-    // Fallback via /api/public/upload if browser blocked direct CORS PUT and file <= 4MB
-    if (err instanceof Error && err.message === 'DIRECT_CORS_ERROR' && file.size <= 4 * 1024 * 1024) {
-      return new Promise<CdnAsset>((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        const startTime = Date.now();
-        xhr.open('POST', '/api/public/upload', true);
-        xhr.setRequestHeader('Content-Type', mimeType);
-        xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
-        xhr.setRequestHeader('X-File-Type', mimeType);
-        xhr.setRequestHeader('X-File-Size', String(file.size));
-        xhr.setRequestHeader('X-Bucket-Name', bucketName);
-        if (uploaderName?.trim()) {
-          xhr.setRequestHeader('X-Uploader-Name', encodeURIComponent(uploaderName.trim()));
-        }
-
-        xhr.upload.onprogress = (event) => {
-          if (event.lengthComputable && onProgress) {
-            const pct = Math.min(95, Math.round((event.loaded / event.total) * 95));
-            const elapsedSec = Math.max(0.25, (Date.now() - startTime) / 1000);
-            onProgress(pct, event.loaded / elapsedSec);
+    // Fallback via /api/public/upload if browser blocked direct CORS PUT
+    if (err instanceof Error && err.message === 'DIRECT_CORS_ERROR') {
+      if (file.size <= 4.5 * 1024 * 1024) {
+        return new Promise<CdnAsset>((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          const startTime = Date.now();
+          xhr.open('POST', '/api/public/upload', true);
+          xhr.setRequestHeader('Content-Type', mimeType);
+          xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+          xhr.setRequestHeader('X-File-Type', mimeType);
+          xhr.setRequestHeader('X-File-Size', String(file.size));
+          xhr.setRequestHeader('X-Bucket-Name', bucketName);
+          if (uploaderName?.trim()) {
+            xhr.setRequestHeader('X-Uploader-Name', encodeURIComponent(uploaderName.trim()));
           }
-        };
 
-        xhr.onload = () => {
-          try {
-            const data = JSON.parse(xhr.responseText) as { item?: CdnAsset; error?: string };
-            if (xhr.status >= 200 && xhr.status < 300 && data.item) {
-              onProgress?.(100, 0);
-              resolve(data.item);
-            } else {
-              reject(new Error(data.error || `Tải lên thất bại (HTTP ${xhr.status}).`));
+          xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable && onProgress) {
+              const pct = Math.min(95, Math.round((event.loaded / event.total) * 95));
+              const elapsedSec = Math.max(0.25, (Date.now() - startTime) / 1000);
+              onProgress(pct, event.loaded / elapsedSec);
             }
-          } catch {
-            reject(new Error(`Phản hồi máy chủ không hợp lệ (HTTP ${xhr.status}).`));
-          }
-        };
+          };
 
-        xhr.onerror = () => reject(new Error('Lỗi kết nối mạng khi gửi tệp lên Cloud.'));
-        xhr.send(file);
-      });
+          xhr.onload = () => {
+            try {
+              const data = JSON.parse(xhr.responseText) as { item?: CdnAsset; error?: string };
+              if (xhr.status >= 200 && xhr.status < 300 && data.item) {
+                onProgress?.(100, 0);
+                resolve(data.item);
+              } else {
+                reject(new Error(data.error || `Tải lên thất bại (HTTP ${xhr.status}).`));
+              }
+            } catch {
+              reject(new Error(`Phản hồi máy chủ không hợp lệ (HTTP ${xhr.status}).`));
+            }
+          };
+
+          xhr.onerror = () => reject(new Error('Lỗi kết nối mạng khi gửi tệp lên Cloud.'));
+          xhr.send(file);
+        });
+      }
+      throw new Error(
+        'Trình duyệt hoặc trình chặn quảng cáo đã chặn tải lên trực tiếp Google Drive. Vui lòng thử tắt chặn quảng cáo hoặc thử tệp nhỏ hơn 4.5MB.'
+      );
     }
     throw err;
   }

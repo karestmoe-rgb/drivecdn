@@ -40,6 +40,7 @@ export interface StorageQuotaRef {
 
 interface OwnerCloudRelay {
   enabled: boolean;
+  mode?: 'oauth' | 'bridge';
   accessToken: string;
   expiresAt: number;
   ownerName: string;
@@ -53,12 +54,19 @@ const IS_VERCEL = Boolean(process.env.VERCEL);
 const KV_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '';
 const KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const HAS_KV = Boolean(KV_URL && KV_TOKEN);
+const DRIVE_BRIDGE_URL = (process.env.DRIVE_BRIDGE_URL || '').trim();
+const DRIVE_BRIDGE_SECRET = (process.env.DRIVE_BRIDGE_SECRET || '').trim();
+const PINNED_DRIVE_FOLDER_ID = (process.env.DRIVE_FOLDER_ID || '').trim();
 
 const DATA_DIR = IS_VERCEL ? '/tmp/drivecdn-data' : path.resolve(process.cwd(), 'data');
 const CATALOG_PATH = path.join(DATA_DIR, 'cdn-catalog.json');
+const RELAY_PATH = path.join(DATA_DIR, 'relay.json');
 
-// In-memory fallback relay session
+// In-memory cache
 let memoryRelay: OwnerCloudRelay | null = null;
+let bridgeRefreshPromise: Promise<OwnerCloudRelay | null> | null = null;
+let lastBridgeError: string | null = null;
+let cachedDriveCatalog: { items: CatalogEntry[]; fetchedAt: number } | null = null;
 
 async function kvGet<T>(key: string): Promise<T | null> {
   if (!HAS_KV) return null;
@@ -143,27 +151,276 @@ async function writeCatalog(entries: CatalogEntry[]): Promise<void> {
   }
 }
 
-async function getActiveRelay(): Promise<OwnerCloudRelay | null> {
-  let relay = memoryRelay;
-  if (HAS_KV) {
-    const fromKv = await kvGet<OwnerCloudRelay>('drivecdn:relay');
-    if (fromKv) relay = fromKv;
-  }
-  if (!relay || !relay.enabled || !relay.accessToken || Date.now() >= relay.expiresAt) {
+function readRelayFromDisk(): OwnerCloudRelay | null {
+  try {
+    if (!fs.existsSync(RELAY_PATH)) return null;
+    const raw = fs.readFileSync(RELAY_PATH, 'utf-8');
+    const parsed = JSON.parse(raw) as OwnerCloudRelay;
+    if (!parsed || !parsed.accessToken || !parsed.enabled) return null;
+    return parsed;
+  } catch {
     return null;
   }
-  return relay;
+}
+
+function writeRelayToDisk(relay: OwnerCloudRelay | null): void {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    if (!relay) {
+      if (fs.existsSync(RELAY_PATH)) fs.unlinkSync(RELAY_PATH);
+      return;
+    }
+    fs.writeFileSync(RELAY_PATH, JSON.stringify(relay, null, 2), 'utf-8');
+  } catch {
+    // Ignore read-only FS errors
+  }
 }
 
 async function setActiveRelay(relay: OwnerCloudRelay | null): Promise<void> {
   memoryRelay = relay;
+  writeRelayToDisk(relay);
   if (HAS_KV) {
     if (relay) {
-      await kvSet('drivecdn:relay', relay, 3600);
+      const ttl = Math.max(60, Math.floor((relay.expiresAt - Date.now()) / 1000));
+      await kvSet('drivecdn:relay', relay, ttl);
     } else {
       await kvDel('drivecdn:relay');
     }
   }
+}
+
+async function fetchBridgeRelay(): Promise<OwnerCloudRelay | null> {
+  if (!DRIVE_BRIDGE_URL) return null;
+  if (bridgeRefreshPromise) return bridgeRefreshPromise;
+
+  bridgeRefreshPromise = (async () => {
+    try {
+      const url = new URL(DRIVE_BRIDGE_URL);
+      if (DRIVE_BRIDGE_SECRET) {
+        url.searchParams.set('secret', DRIVE_BRIDGE_SECRET);
+      }
+      if (PINNED_DRIVE_FOLDER_ID) {
+        url.searchParams.set('folderId', PINNED_DRIVE_FOLDER_ID);
+      }
+
+      const res = await fetch(url.toString(), {
+        method: 'GET',
+        redirect: 'follow',
+        headers: { Accept: 'application/json' },
+      });
+
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || contentType.includes('text/html')) {
+        lastBridgeError =
+          'DRIVE_BRIDGE_URL không trả về JSON. Hãy kiểm tra lại bước Deploy Apps Script chọn "Who has access: Anyone".';
+        return null;
+      }
+
+      const data = (await res.json()) as {
+        error?: string;
+        accessToken?: string;
+        expiresIn?: number;
+        ownerName?: string;
+        ownerEmail?: string;
+        rootFolderId?: string;
+        buckets?: DriveFolderRef[];
+        storageQuota?: StorageQuotaRef | null;
+      };
+
+      const resolvedRootId = PINNED_DRIVE_FOLDER_ID || data.rootFolderId || '';
+      if (data.error || !data.accessToken || !resolvedRootId) {
+        lastBridgeError = data.error || 'Dữ liệu từ DRIVE_BRIDGE_URL thiếu accessToken hoặc rootFolderId.';
+        return null;
+      }
+
+      const rawBuckets = Array.isArray(data.buckets) ? data.buckets : [];
+      const bucketMap = new Map<string, DriveFolderRef>();
+      bucketMap.set(resolvedRootId, { id: resolvedRootId, name: 'DriveCDN' });
+      for (const b of rawBuckets) {
+        if (b?.id && !bucketMap.has(b.id)) {
+          bucketMap.set(b.id, b);
+        }
+      }
+
+      lastBridgeError = null;
+      const ttlMs = Math.min(Number(data.expiresIn || 2700), 3000) * 1000;
+      const relay: OwnerCloudRelay = {
+        enabled: true,
+        mode: 'bridge',
+        accessToken: data.accessToken,
+        expiresAt: Date.now() + ttlMs,
+        ownerName: data.ownerName || (data.ownerEmail ? data.ownerEmail.split('@')[0] : 'Google Drive Cloud'),
+        ownerEmail: data.ownerEmail || '',
+        rootFolderId: resolvedRootId,
+        buckets: Array.from(bucketMap.values()),
+        storageQuota: data.storageQuota ?? null,
+      };
+
+      await setActiveRelay(relay);
+      return relay;
+    } catch (err) {
+      lastBridgeError = err instanceof Error ? err.message : 'Không thể kết nối DRIVE_BRIDGE_URL.';
+      return null;
+    } finally {
+      bridgeRefreshPromise = null;
+    }
+  })();
+
+  return bridgeRefreshPromise;
+}
+
+async function getActiveRelay(forceRefreshBridge = false): Promise<OwnerCloudRelay | null> {
+  if (!forceRefreshBridge) {
+    let relay = memoryRelay;
+    if (!relay && HAS_KV) {
+      const fromKv = await kvGet<OwnerCloudRelay>('drivecdn:relay');
+      if (fromKv) relay = fromKv;
+    }
+    if (!relay) {
+      relay = readRelayFromDisk();
+    }
+    if (relay && relay.enabled && relay.accessToken && Date.now() < relay.expiresAt) {
+      memoryRelay = relay;
+      return relay;
+    }
+  }
+
+  if (DRIVE_BRIDGE_URL) {
+    return fetchBridgeRelay();
+  }
+
+  return null;
+}
+
+async function listDriveFilesFromRelay(relay: OwnerCloudRelay): Promise<CatalogEntry[]> {
+  if (cachedDriveCatalog && Date.now() - cachedDriveCatalog.fetchedAt < 20_000) {
+    return cachedDriveCatalog.items;
+  }
+
+  try {
+    const items: CatalogEntry[] = [];
+    const seenFileIds = new Set<string>();
+    const foldersToScan = new Map<string, DriveFolderRef>();
+    if (PINNED_DRIVE_FOLDER_ID) {
+      foldersToScan.set(PINNED_DRIVE_FOLDER_ID, { id: PINNED_DRIVE_FOLDER_ID, name: 'DriveCDN' });
+    }
+    if (relay.rootFolderId) {
+      foldersToScan.set(relay.rootFolderId, { id: relay.rootFolderId, name: 'DriveCDN' });
+    }
+    for (const b of relay.buckets) {
+      if (b.id && !foldersToScan.has(b.id)) {
+        foldersToScan.set(b.id, b);
+      }
+    }
+
+    for (const folder of foldersToScan.values()) {
+      const q = `'${folder.id}' in parents and trashed = false`;
+      const fields =
+        'files(id,name,mimeType,size,thumbnailLink,webViewLink,createdTime,imageMediaMetadata,videoMediaMetadata,permissions(id,type,role))';
+      const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=${encodeURIComponent(fields)}&orderBy=createdTime desc&pageSize=100`;
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${relay.accessToken}` },
+      });
+      if (!res.ok) continue;
+
+      const data = (await res.json()) as {
+        files?: Array<{
+          id: string;
+          name: string;
+          mimeType: string;
+          size?: string;
+          thumbnailLink?: string;
+          webViewLink?: string;
+          createdTime?: string;
+          imageMediaMetadata?: { width?: number; height?: number };
+          videoMediaMetadata?: { width?: number; height?: number; durationMillis?: string };
+          permissions?: Array<{ id: string; type: string; role: string }>;
+        }>;
+      };
+
+      for (const f of data.files ?? []) {
+        if (seenFileIds.has(f.id)) continue;
+        if (!f.mimeType.startsWith('image/') && !f.mimeType.startsWith('video/')) continue;
+        const isAnyonePublic = Boolean((f.permissions ?? []).some((p) => p.type === 'anyone'));
+        if (!isAnyonePublic) continue;
+
+        seenFileIds.add(f.id);
+        const kind: 'image' | 'video' = f.mimeType.startsWith('video/') ? 'video' : 'image';
+        const logicalBucket =
+          folder.name && folder.name !== 'DriveCDN'
+            ? folder.name
+            : kind === 'video'
+            ? 'Videos'
+            : 'Images';
+
+        items.push({
+          fileId: f.id,
+          name: f.name,
+          mimeType: f.mimeType,
+          size: Number(f.size || 0),
+          kind,
+          bucket: logicalBucket,
+          folderId: folder.id,
+          width: f.imageMediaMetadata?.width ?? f.videoMediaMetadata?.width,
+          height: f.imageMediaMetadata?.height ?? f.videoMediaMetadata?.height,
+          durationMillis: f.videoMediaMetadata?.durationMillis
+            ? Number(f.videoMediaMetadata.durationMillis)
+            : undefined,
+          thumbnailLink: f.thumbnailLink,
+          webViewLink: f.webViewLink,
+          isPublic: true,
+          createdTime: f.createdTime || new Date().toISOString(),
+          publishedAt: f.createdTime || new Date().toISOString(),
+          ownerName: relay.ownerName,
+          ownerEmail: relay.ownerEmail,
+        });
+      }
+    }
+
+    cachedDriveCatalog = { items, fetchedAt: Date.now() };
+    return items;
+  } catch {
+    return cachedDriveCatalog?.items ?? [];
+  }
+}
+
+async function collectRequestBuffer(req: Request, maxBytes: number): Promise<Buffer> {
+  if (Buffer.isBuffer(req.body)) {
+    if (req.body.length > maxBytes) {
+      throw new Error('Tệp vượt quá giới hạn tải qua proxy máy chủ.');
+    }
+    return req.body;
+  }
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let settled = false;
+    req.on('data', (chunk: Buffer | string) => {
+      if (settled) return;
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buf.length;
+      if (total > maxBytes) {
+        settled = true;
+        reject(new Error('Tệp vượt quá giới hạn tải qua proxy máy chủ.'));
+        return;
+      }
+      chunks.push(buf);
+    });
+    req.on('end', () => {
+      if (!settled) {
+        settled = true;
+        resolve(Buffer.concat(chunks));
+      }
+    });
+    req.on('error', (err) => {
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
+    });
+  });
 }
 
 async function verifyDriveToken(
@@ -402,10 +659,14 @@ export function createApiApp(): Express {
     }
 
     const kind: 'image' | 'video' = mimeType.startsWith('video/') ? 'video' : 'image';
-    const targetBucket =
-      relay.buckets.find((b) => b.name === requestedBucket) ||
-      relay.buckets.find((b) => b.name === (kind === 'video' ? 'Videos' : 'Images')) ||
-      relay.buckets[0];
+    const singleFolderId = PINNED_DRIVE_FOLDER_ID || relay.rootFolderId || relay.buckets[0]?.id;
+    const logicalBucket =
+      requestedBucket && requestedBucket !== 'AUTO' && requestedBucket !== 'DriveCDN'
+        ? requestedBucket
+        : kind === 'video'
+        ? 'Videos'
+        : 'Images';
+    const targetBucket = singleFolderId ? { id: singleFolderId, name: logicalBucket } : null;
 
     if (!targetBucket) {
       res.status(500).json({ error: 'Không tìm thấy thư mục lưu trữ trên Google Drive.' });
@@ -413,16 +674,19 @@ export function createApiApp(): Express {
     }
 
     try {
+      const fileBuffer = await collectRequestBuffer(req, IS_VERCEL ? 5 * 1024 * 1024 : 50 * 1024 * 1024);
+      const effectiveLength = fileBuffer.length;
+
       const initHeaders: Record<string, string> = {
         Authorization: `Bearer ${relay.accessToken}`,
         'Content-Type': 'application/json; charset=UTF-8',
         'X-Upload-Content-Type': mimeType,
       };
-      if (fileSize > 0) {
-        initHeaders['X-Upload-Content-Length'] = String(fileSize);
+      if (effectiveLength > 0) {
+        initHeaders['X-Upload-Content-Length'] = String(effectiveLength);
       }
 
-      const initRes = await fetch(
+      let initRes = await fetch(
         'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id',
         {
           method: 'POST',
@@ -433,6 +697,25 @@ export function createApiApp(): Express {
           }),
         }
       );
+
+      if (initRes.status === 401 && DRIVE_BRIDGE_URL) {
+        const refreshed = await getActiveRelay(true);
+        if (refreshed) {
+          relay.accessToken = refreshed.accessToken;
+          initHeaders['Authorization'] = `Bearer ${refreshed.accessToken}`;
+          initRes = await fetch(
+            'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id',
+            {
+              method: 'POST',
+              headers: initHeaders,
+              body: JSON.stringify({
+                name: fileName,
+                parents: [targetBucket.id],
+              }),
+            }
+          );
+        }
+      }
 
       if (initRes.status === 401) {
         await setActiveRelay(null);
@@ -454,15 +737,15 @@ export function createApiApp(): Express {
         return;
       }
 
-      const putHeaders: Record<string, string> = { 'Content-Type': mimeType };
-      if (fileSize > 0) putHeaders['Content-Length'] = String(fileSize);
+      const putHeaders: Record<string, string> = {
+        'Content-Type': mimeType,
+        'Content-Length': String(effectiveLength),
+      };
 
       const uploadRes = await fetch(uploadUrl, {
         method: 'PUT',
         headers: putHeaders,
-        body: Readable.toWeb(req) as unknown as BodyInit,
-        // @ts-expect-error Node fetch streaming requires duplex: 'half'
-        duplex: 'half',
+        body: new Uint8Array(fileBuffer),
       });
 
       if (!uploadRes.ok) {
@@ -482,8 +765,10 @@ export function createApiApp(): Express {
         relay.ownerEmail,
         fileName,
         mimeType,
-        fileSize
+        effectiveLength || fileSize
       );
+
+      cachedDriveCatalog = null;
 
       if (relay.storageQuota) {
         relay.storageQuota.usage += entry.size;
@@ -580,10 +865,14 @@ export function createApiApp(): Express {
     }
 
     const kind: 'image' | 'video' = mimeType.startsWith('video/') ? 'video' : 'image';
-    const targetBucket =
-      relay.buckets.find((b) => b.name === bucketName) ||
-      relay.buckets.find((b) => b.name === (kind === 'video' ? 'Videos' : 'Images')) ||
-      relay.buckets[0];
+    const singleFolderId = PINNED_DRIVE_FOLDER_ID || relay.rootFolderId || relay.buckets[0]?.id;
+    const logicalBucket =
+      bucketName && bucketName !== 'AUTO' && bucketName !== 'DriveCDN'
+        ? bucketName
+        : kind === 'video'
+        ? 'Videos'
+        : 'Images';
+    const targetBucket = singleFolderId ? { id: singleFolderId, name: logicalBucket } : null;
 
     if (!targetBucket) {
       res.status(500).json({ error: 'Không tìm thấy thư mục lưu trữ trên Google Drive.' });
@@ -599,12 +888,19 @@ export function createApiApp(): Express {
       if (fileSize && fileSize > 0) {
         initHeaders['X-Upload-Content-Length'] = String(fileSize);
       }
-      const clientOrigin = req.headers.origin;
+      let clientOrigin = req.headers.origin;
+      if (!clientOrigin && req.headers.referer) {
+        try {
+          clientOrigin = new URL(req.headers.referer).origin;
+        } catch {
+          // Ignore malformed referer
+        }
+      }
       if (clientOrigin) {
         initHeaders['Origin'] = clientOrigin;
       }
 
-      const initRes = await fetch(
+      let initRes = await fetch(
         'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,mimeType,size',
         {
           method: 'POST',
@@ -615,6 +911,24 @@ export function createApiApp(): Express {
           }),
         }
       );
+
+      if (initRes.status === 401 && DRIVE_BRIDGE_URL) {
+        const refreshed = await getActiveRelay(true);
+        if (refreshed) {
+          initHeaders['Authorization'] = `Bearer ${refreshed.accessToken}`;
+          initRes = await fetch(
+            'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,mimeType,size',
+            {
+              method: 'POST',
+              headers: initHeaders,
+              body: JSON.stringify({
+                name: fileName,
+                parents: [targetBucket.id],
+              }),
+            }
+          );
+        }
+      }
 
       if (initRes.status === 401) {
         await setActiveRelay(null);
@@ -684,6 +998,8 @@ export function createApiApp(): Express {
         fileSize
       );
 
+      cachedDriveCatalog = null;
+
       if (relay.storageQuota) {
         relay.storageQuota.usage += entry.size;
         await setActiveRelay(relay);
@@ -702,6 +1018,10 @@ export function createApiApp(): Express {
     res.json({
       enabled: Boolean(relay?.enabled),
       active: Boolean(relay),
+      mode: relay?.mode,
+      bridgeConfigured: Boolean(DRIVE_BRIDGE_URL),
+      bridgeError: !relay && lastBridgeError ? lastBridgeError : undefined,
+      rootFolderId: PINNED_DRIVE_FOLDER_ID || relay?.rootFolderId,
       ownerName: relay?.ownerName,
       ownerEmail: relay?.ownerEmail,
       expiresAt: relay?.expiresAt,
@@ -732,8 +1052,9 @@ export function createApiApp(): Express {
 
     const nextRelay: OwnerCloudRelay = {
       enabled: Boolean(enabled),
+      mode: 'oauth',
       accessToken: token,
-      expiresAt: Date.now() + 55 * 60 * 1000,
+      expiresAt: Date.now() + 58 * 60 * 1000,
       ownerName: driveUser.displayName || 'Chủ sở hữu Drive',
       ownerEmail: driveUser.emailAddress || '',
       rootFolderId,
@@ -746,6 +1067,8 @@ export function createApiApp(): Express {
     res.json({
       enabled: nextRelay.enabled,
       active: true,
+      mode: nextRelay.mode,
+      bridgeConfigured: Boolean(DRIVE_BRIDGE_URL),
       ownerName: nextRelay.ownerName,
       ownerEmail: nextRelay.ownerEmail,
       expiresAt: nextRelay.expiresAt,
@@ -764,11 +1087,32 @@ export function createApiApp(): Express {
       }
     }
     await setActiveRelay(null);
-    res.json({ enabled: false, active: false });
+    res.json({
+      enabled: false,
+      active: false,
+      bridgeConfigured: Boolean(DRIVE_BRIDGE_URL),
+    });
   });
 
   app.get('/api/cdn/catalog', async (_req: Request, res: Response) => {
-    const entries = (await readCatalog()).filter((item) => item.isPublic);
+    const localEntries = (await readCatalog()).filter((item) => item.isPublic);
+    const mergedMap = new Map<string, CatalogEntry>();
+    for (const item of localEntries) {
+      mergedMap.set(item.fileId, item);
+    }
+
+    const relay = await getActiveRelay();
+    if (relay) {
+      const driveItems = await listDriveFilesFromRelay(relay);
+      for (const drv of driveItems) {
+        const existing = mergedMap.get(drv.fileId);
+        mergedMap.set(drv.fileId, existing ? { ...drv, ...existing, thumbnailLink: drv.thumbnailLink || existing.thumbnailLink } : drv);
+      }
+    }
+
+    const entries = Array.from(mergedMap.values()).sort(
+      (a, b) => new Date(b.createdTime).getTime() - new Date(a.createdTime).getTime()
+    );
     const totalBytes = entries.reduce((sum, item) => sum + (Number(item.size) || 0), 0);
     const imageCount = entries.filter((item) => item.kind === 'image').length;
     const videoCount = entries.filter((item) => item.kind === 'video').length;
@@ -858,6 +1202,7 @@ export function createApiApp(): Express {
         catalog.unshift(entry);
       }
       await writeCatalog(catalog);
+      cachedDriveCatalog = null;
 
       res.json({ item: entry });
     } catch (err) {
@@ -886,6 +1231,7 @@ export function createApiApp(): Express {
     if (name) catalog[idx].name = name;
     if (bucket) catalog[idx].bucket = bucket;
     await writeCatalog(catalog);
+    cachedDriveCatalog = null;
     res.json({ item: catalog[idx] });
   });
 
@@ -901,6 +1247,7 @@ export function createApiApp(): Express {
     const catalog = await readCatalog();
     const next = catalog.filter((item) => item.fileId !== fileId);
     await writeCatalog(next);
+    cachedDriveCatalog = null;
     res.json({ removed: catalog.length !== next.length });
   });
 

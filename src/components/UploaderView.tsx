@@ -35,11 +35,12 @@ export function UploaderView({
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const canUpload = isOwnerSignedIn || relayStatus.active;
+  const customBuckets = (ownerBuckets.length > 0 ? ownerBuckets : relayStatus.buckets).filter(
+    (b) => b.name !== 'DriveCDN'
+  );
   const availableBuckets =
-    ownerBuckets.length > 0
-      ? ownerBuckets
-      : relayStatus.buckets.length > 0
-      ? relayStatus.buckets
+    customBuckets.length > 0
+      ? customBuckets
       : [
           { id: 'Images', name: 'Images' },
           { id: 'Videos', name: 'Videos' },
