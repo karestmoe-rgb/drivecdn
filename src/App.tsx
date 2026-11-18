@@ -355,6 +355,22 @@ export default function App() {
     }
   };
 
+  const handleRetryProfile = useCallback(async () => {
+    if (!authUser) return;
+    setAuthError(null);
+    setUserProfile(null);
+    try {
+      const token = await authUser.getIdToken(true);
+      setFirebaseIdToken(token);
+      const synced = await syncUserProfileOnSignIn(authUser);
+      setUserProfile(synced);
+    } catch (err) {
+      setAuthError(
+        err instanceof Error ? err.message : 'Không thể đồng bộ hồ sơ tài khoản Google.'
+      );
+    }
+  }, [authUser]);
+
   const handleSignOut = async () => {
     const driveToken = getCachedDriveToken();
     const idToken = await getFirebaseIdToken();
@@ -683,6 +699,7 @@ export default function App() {
           onSignInAdminGoogle={handleSignInRegularUser}
           onConnectDriveHost={handleConnectDriveHost}
           onSignOut={handleSignOut}
+          onRetryProfile={handleRetryProfile}
           onSwitchToUserPortal={() => switchPanel('user')}
           onRefreshAssets={() => void refreshAll()}
           onInspectAsset={(asset) => setSelectedAsset(asset)}
@@ -705,6 +722,7 @@ export default function App() {
           uploadTasks={uploadTasks}
           onSignInUser={handleSignInRegularUser}
           onSignOut={handleSignOut}
+          onRetryProfile={handleRetryProfile}
           onSwitchToAdmin={() => switchPanel('admin')}
           onRefreshAssets={() => void refreshAll()}
           onInspectAsset={(asset) => setSelectedAsset(asset)}

@@ -26,7 +26,7 @@ import defaultFirebaseConfig from '../../firebase-applet-config.json';
 import type { UserAccount, UserStatus } from '../types/cdn';
 
 export const DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.file'];
-const BOOTSTRAPPED_ADMIN_EMAIL = 'karestmoe@gmail.com';
+const DEFAULT_ADMIN_EMAIL = 'karestmoe@gmail.com';
 
 export interface FirebaseClientConfig {
   apiKey: string;
@@ -36,6 +36,7 @@ export interface FirebaseClientConfig {
   storageBucket?: string;
   messagingSenderId?: string;
   firestoreDatabaseId?: string;
+  adminEmail?: string;
 }
 
 export enum OperationType {
@@ -114,6 +115,48 @@ async function testConnection(db: Firestore): Promise<void> {
   }
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(timeoutMessage));
+    }, ms);
+    promise.then(
+      (val) => {
+        clearTimeout(timer);
+        resolve(val);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+export function formatFirestoreUiError(rawMessage: string): string {
+  let detail = rawMessage;
+  let path = '';
+  try {
+    const parsed = JSON.parse(rawMessage) as { error?: string; path?: string };
+    if (parsed.error) detail = parsed.error;
+    if (parsed.path) path = parsed.path;
+  } catch {
+    // Plain message
+  }
+
+  const lower = detail.toLowerCase();
+  if (lower.includes('client is offline') || lower.includes('timed out') || lower.includes('timeout')) {
+    return `Không thể kết nối tới Cloud Firestore (${path || 'database'}) trên project "${activeFirebaseConfig.projectId}". Hãy kiểm tra: (1) Đã tạo Cloud Firestore Database trên Firebase Console chưa, (2) Nếu dùng database mặc định thì FIREBASE_FIRESTORE_DATABASE_ID phải là "(default)" (không phải "default"), và (3) Kiểm tra mạng/VPN/chặn quảng cáo.`;
+  }
+  if (lower.includes('permission') || lower.includes('insufficient')) {
+    return `Firestore từ chối quyền truy cập (${path || 'users'}). Hãy kiểm tra bạn đã copy nội dung file firestore.rules lên Firebase Console -> Firestore Database -> Rules và bấm Publish chưa.`;
+  }
+  if (lower.includes('not_found') || lower.includes('does not exist')) {
+    return `Không tìm thấy Firestore database "${activeFirebaseConfig.firestoreDatabaseId || '(default)'}" trên project "${activeFirebaseConfig.projectId}". Hãy kiểm tra lại FIREBASE_FIRESTORE_DATABASE_ID.`;
+  }
+  return detail;
+}
+
 export async function getFirebaseServices(): Promise<{
   app: FirebaseApp;
   auth: Auth;
@@ -136,6 +179,7 @@ export async function getFirebaseServices(): Promise<{
               storageBucket: data.storageBucket || '',
               messagingSenderId: data.messagingSenderId || '',
               firestoreDatabaseId: data.firestoreDatabaseId || '',
+              adminEmail: data.adminEmail || DEFAULT_ADMIN_EMAIL,
             };
           }
         }
@@ -146,9 +190,11 @@ export async function getFirebaseServices(): Promise<{
       activeFirebaseConfig = resolved;
       const existing = getApps()[0];
       const app = existing ?? initializeApp(resolved);
-      const db = resolved.firestoreDatabaseId
-        ? getFirestore(app, resolved.firestoreDatabaseId)
-        : getFirestore(app);
+      const rawDbId = resolved.firestoreDatabaseId?.trim() || '';
+      const db =
+        rawDbId && rawDbId !== '(default)' && rawDbId !== 'default'
+          ? getFirestore(app, rawDbId)
+          : getFirestore(app);
       const auth = getAuth(app);
 
       cachedAuth = auth;
@@ -277,107 +323,151 @@ export async function signOutAccount(): Promise<void> {
 
 // ---------------- Firestore RBAC Sync & Admin Controls ----------------
 
+function getConfiguredAdminEmail(config: FirebaseClientConfig): string {
+  return (config.adminEmail || DEFAULT_ADMIN_EMAIL).trim().toLowerCase();
+}
+
 export async function checkIsAdminUser(user: User): Promise<boolean> {
-  const { db } = await getFirebaseServices();
-  if (user.emailVerified && user.email?.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL) {
+  const { db, config } = await getFirebaseServices();
+  const adminEmail = getConfiguredAdminEmail(config);
+  if (user.emailVerified && user.email?.toLowerCase() === adminEmail) {
     return true;
   }
   try {
-    const snap = await getDoc(doc(db, 'admins', user.uid));
+    const snap = await withTimeout(
+      getDoc(doc(db, 'admins', user.uid)),
+      10000,
+      'Firestore request timed out while checking admin record.'
+    );
     return snap.exists();
   } catch {
     return false;
   }
 }
 
-export async function syncUserProfileOnSignIn(user: User): Promise<UserAccount> {
-  const { db } = await getFirebaseServices();
-  const isAdmin = await checkIsAdminUser(user);
-  const safeDisplayName = (user.displayName || user.email?.split('@')[0] || 'Google User').slice(0, 120);
-  const safeEmail = (user.email || '').slice(0, 254);
-  const safePhoto = user.photoURL ? user.photoURL.slice(0, 500) : undefined;
+const syncInFlightByUid = new Map<string, Promise<UserAccount>>();
 
-  if (isAdmin && user.emailVerified && user.email?.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL) {
-    const adminRef = doc(db, 'admins', user.uid);
+export async function syncUserProfileOnSignIn(user: User): Promise<UserAccount> {
+  const existingTask = syncInFlightByUid.get(user.uid);
+  if (existingTask) return existingTask;
+
+  const task = (async (): Promise<UserAccount> => {
+    const { db, config } = await getFirebaseServices();
+    const adminEmail = getConfiguredAdminEmail(config);
+    const isAdmin = await checkIsAdminUser(user);
+    const safeDisplayName = (user.displayName || user.email?.split('@')[0] || 'Google User').slice(0, 120);
+    const safeEmail = (user.email || '').slice(0, 254);
+    const safePhoto = user.photoURL ? user.photoURL.slice(0, 500) : undefined;
+
+    if (isAdmin && user.emailVerified && user.email?.toLowerCase() === adminEmail) {
+      const adminRef = doc(db, 'admins', user.uid);
+      try {
+        const adminSnap = await withTimeout(
+          getDoc(adminRef),
+          12000,
+          'Firestore request timed out (the client is offline).'
+        );
+        if (!adminSnap.exists()) {
+          await withTimeout(
+            setDoc(adminRef, {
+              uid: user.uid,
+              email: safeEmail,
+              displayName: safeDisplayName,
+              createdAt: serverTimestamp(),
+            }),
+            12000,
+            'Firestore write timed out (the client is offline).'
+          );
+        }
+      } catch (error) {
+        handleFirestoreError(error, OperationType.WRITE, `admins/${user.uid}`);
+      }
+    }
+
+    const userPath = `users/${user.uid}`;
+    const userRef = doc(db, 'users', user.uid);
+
     try {
-      const adminSnap = await getDoc(adminRef);
-      if (!adminSnap.exists()) {
-        await setDoc(adminRef, {
+      const snap = await withTimeout(
+        getDoc(userRef),
+        12000,
+        'Firestore read timed out (the client is offline).'
+      );
+      if (!snap.exists()) {
+        const payload: Record<string, unknown> = {
           uid: user.uid,
           email: safeEmail,
           displayName: safeDisplayName,
+          role: isAdmin ? 'admin' : 'user',
+          status: isAdmin ? 'approved' : 'pending',
+          canView: isAdmin,
+          canUpload: isAdmin,
           createdAt: serverTimestamp(),
-        });
+          updatedAt: serverTimestamp(),
+        };
+        if (safePhoto) {
+          payload.photoURL = safePhoto;
+        }
+        await withTimeout(
+          setDoc(userRef, payload),
+          12000,
+          'Firestore create user profile timed out (the client is offline).'
+        );
+
+        return {
+          uid: user.uid,
+          email: safeEmail,
+          displayName: safeDisplayName,
+          photoURL: safePhoto,
+          role: isAdmin ? 'admin' : 'user',
+          status: isAdmin ? 'approved' : 'pending',
+          canView: isAdmin,
+          canUpload: isAdmin,
+        };
       }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, `admins/${user.uid}`);
-    }
-  }
 
-  const userPath = `users/${user.uid}`;
-  const userRef = doc(db, 'users', user.uid);
-
-  try {
-    const snap = await getDoc(userRef);
-    if (!snap.exists()) {
-      const payload: Record<string, unknown> = {
-        uid: user.uid,
-        email: safeEmail,
+      const existing = snap.data() as UserAccount;
+      const patch: Record<string, unknown> = {
         displayName: safeDisplayName,
-        role: isAdmin ? 'admin' : 'user',
-        status: isAdmin ? 'approved' : 'pending',
-        canView: isAdmin,
-        canUpload: isAdmin,
-        createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       };
       if (safePhoto) {
-        payload.photoURL = safePhoto;
+        patch.photoURL = safePhoto;
       }
-      await setDoc(userRef, payload);
+
+      // Ensure bootstrapped admin always keeps admin flags
+      if (isAdmin && (existing.role !== 'admin' || existing.status !== 'approved' || !existing.canView || !existing.canUpload)) {
+        patch.role = 'admin';
+        patch.status = 'approved';
+        patch.canView = true;
+        patch.canUpload = true;
+      }
+
+      await withTimeout(
+        updateDoc(userRef, patch),
+        12000,
+        'Firestore update user profile timed out (the client is offline).'
+      );
 
       return {
-        uid: user.uid,
-        email: safeEmail,
+        ...existing,
         displayName: safeDisplayName,
-        photoURL: safePhoto,
-        role: isAdmin ? 'admin' : 'user',
-        status: isAdmin ? 'approved' : 'pending',
-        canView: isAdmin,
-        canUpload: isAdmin,
+        photoURL: safePhoto || existing.photoURL,
+        role: isAdmin ? 'admin' : existing.role,
+        status: isAdmin ? 'approved' : existing.status,
+        canView: isAdmin ? true : Boolean(existing.canView),
+        canUpload: isAdmin ? true : Boolean(existing.canUpload),
       };
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, userPath);
     }
+  })();
 
-    const existing = snap.data() as UserAccount;
-    const patch: Record<string, unknown> = {
-      displayName: safeDisplayName,
-      updatedAt: serverTimestamp(),
-    };
-    if (safePhoto) {
-      patch.photoURL = safePhoto;
-    }
-
-    // Ensure bootstrapped admin always keeps admin flags
-    if (isAdmin && (existing.role !== 'admin' || existing.status !== 'approved' || !existing.canView || !existing.canUpload)) {
-      patch.role = 'admin';
-      patch.status = 'approved';
-      patch.canView = true;
-      patch.canUpload = true;
-    }
-
-    await updateDoc(userRef, patch);
-
-    return {
-      ...existing,
-      displayName: safeDisplayName,
-      photoURL: safePhoto || existing.photoURL,
-      role: isAdmin ? 'admin' : existing.role,
-      status: isAdmin ? 'approved' : existing.status,
-      canView: isAdmin ? true : Boolean(existing.canView),
-      canUpload: isAdmin ? true : Boolean(existing.canUpload),
-    };
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, userPath);
+  syncInFlightByUid.set(user.uid, task);
+  try {
+    return await task;
+  } finally {
+    syncInFlightByUid.delete(user.uid);
   }
 }
 

@@ -639,6 +639,13 @@ interface FirebaseServerConfig {
   storageBucket: string;
   messagingSenderId: string;
   firestoreDatabaseId: string;
+  adminEmail: string;
+}
+
+function normalizeFirestoreDatabaseId(raw?: string): string {
+  const trimmed = (raw || '').trim();
+  if (!trimmed || trimmed === 'default') return '(default)';
+  return trimmed;
 }
 
 function resolveFirebaseServerConfig(): FirebaseServerConfig | null {
@@ -655,7 +662,8 @@ function resolveFirebaseServerConfig(): FirebaseServerConfig | null {
       appId,
       storageBucket: process.env.FIREBASE_STORAGE_BUCKET || '',
       messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || '',
-      firestoreDatabaseId: process.env.FIREBASE_FIRESTORE_DATABASE_ID || '(default)',
+      firestoreDatabaseId: normalizeFirestoreDatabaseId(process.env.FIREBASE_FIRESTORE_DATABASE_ID),
+      adminEmail: BOOTSTRAPPED_ADMIN_EMAIL,
     };
   }
 
@@ -671,7 +679,8 @@ function resolveFirebaseServerConfig(): FirebaseServerConfig | null {
           appId: parsed.appId,
           storageBucket: parsed.storageBucket || '',
           messagingSenderId: parsed.messagingSenderId || '',
-          firestoreDatabaseId: parsed.firestoreDatabaseId || '(default)',
+          firestoreDatabaseId: normalizeFirestoreDatabaseId(parsed.firestoreDatabaseId),
+          adminEmail: BOOTSTRAPPED_ADMIN_EMAIL,
         };
       }
     }
@@ -1232,6 +1241,7 @@ export function createApiApp(): Express {
 
   app.get('/api/cloud/status', async (_req: Request, res: Response) => {
     const relay = await getActiveRelay();
+    res.setHeader('Cache-Control', 'no-store');
     res.json({
       enabled: Boolean(relay?.enabled),
       active: Boolean(relay),
