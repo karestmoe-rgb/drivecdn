@@ -1,0 +1,6 @@
+{
+  "name": "DriveCDN",
+  "description": "Public image and video cloud storage and direct media viewer powered by Google Drive.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
